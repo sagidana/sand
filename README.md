@@ -32,7 +32,8 @@ An empty root containing only:
 - the current working directory, read-only, at its own absolute path
 - any paths given with `--ro` or `--rw`, at their own paths
 - a fresh empty `/tmp`, a fresh `/proc`, and a minimal `/dev` with
-  `null`, `zero`, `random`, `urandom`, `tty` and the stdin/stdout/stderr links
+  `null`, `zero`, `random`, `urandom`, `tty`, the stdin/stdout/stderr
+  links, a private `/dev/shm` and a private set of pseudo-terminals
 
 Nothing else from the host exists: no `/home`, no `/root`, no `/var`,
 no `/opt`, no `/run`, no `/sys`. The environment is reduced to `PATH`,
@@ -46,7 +47,7 @@ is set, so setuid programs such as `sudo` do nothing special.
     --hide PATH          make a visible PATH appear empty
     --env NAME           pass the host's NAME through to the command
     --env NAME=VALUE     set NAME for the command
-    --net none|host      no network (default), or the host's network
+    --net none|host      loopback only (default), or the host's network
     --allow RULE         with --net host: allow matching traffic
     --block RULE         with --net host: block matching traffic
     -- COMMAND [ARG]...  run COMMAND instead of $SHELL
@@ -113,15 +114,6 @@ CPU loop, and nothing limits how much a `--rw` directory or `/tmp` can
 grow. There is no wall-clock timeout either; use `timeout(1)` in front.
 Real limits need cgroups, which an unprivileged process only gets when
 the system delegates a cgroup to it.
-
-Loopback in the default network mode. `--net none` leaves the loopback
-interface down, so a program that starts a local server and connects
-to it on 127.0.0.1 fails. Bringing loopback up gives no host access
-and is a small addition.
-
-`/dev/shm` and pseudo-terminals. Neither exists inside, so Python's
-`multiprocessing`, browsers, `tmux`, `script`, and anything that opens
-a pty fail. Both are a tmpfs or a `devpts` mount away.
 
 Domain-based network rules. Rules match addresses, not names. Filtering
 by domain needs a resolver inside the sandbox that only answers allowed

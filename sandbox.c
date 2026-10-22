@@ -8,7 +8,8 @@
  *   - the current working directory, read-only, at its own path
  *   - any extra paths given with --ro or --rw, at their own paths,
  *     minus anything given with --hide
- *   - a fresh /tmp, a fresh /proc, and a minimal /dev
+ *   - a fresh /tmp, a fresh /proc, and a minimal /dev with its own
+ *     /dev/shm and /dev/pts
  * By default it has no network: the new net namespace holds nothing but
  * a down loopback. --net host keeps the host's network instead, and
  * --allow/--block rules then filter it by address and port: a seccomp
@@ -37,6 +38,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
@@ -299,6 +301,15 @@ static void add_dev(void)
     if (symlink("/proc/self/fd/0", STAGE "/dev/stdin") < 0) die("symlink /dev/stdin");
     if (symlink("/proc/self/fd/1", STAGE "/dev/stdout") < 0) die("symlink /dev/stdout");
     if (symlink("/proc/self/fd/2", STAGE "/dev/stderr") < 0) die("symlink /dev/stderr");
+
+    /* Shared memory for multiprocessing and friends. */
+    make_dirs(STAGE "/dev/shm");
+    if (mount("tmpfs", STAGE "/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777") < 0) die("mount /dev/shm");
+
+    /* A private set of pseudo-terminals, so programs can open ptys. */
+    make_dirs(STAGE "/dev/pts");
+    if (mount("devpts", STAGE "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620") < 0) die("mount /dev/pts");
+    if (symlink("pts/ptmx", STAGE "/dev/ptmx") < 0) die("symlink /dev/ptmx");
 }
 
 /* Runs as pid 1 inside the new namespaces, before the shell starts. */
@@ -876,6 +887,24 @@ static void run_command(void)
 }
 
 /* pid 1 inside the sandbox: start the command, reap, exit when it exits. */
+/* The new network namespace starts with loopback down; bring it up so
+ * programs can talk to themselves on 127.0.0.1. Nothing else exists
+ * in that namespace, so this grants no access to the host. */
+static void loopback_up(void)
+{
+    struct ifreq ifr;
+    int sock;
+
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) die("socket");
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "lo");
+    if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) die("get loopback flags");
+    ifr.ifr_flags |= IFF_UP;
+    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) die("bring loopback up");
+    close(sock);
+}
+
 static int run_init(const char *cwd)
 {
     pid_t child;
@@ -893,6 +922,7 @@ static int run_init(const char *cwd)
         binds[i].fd = open(binds[i].path, O_PATH);
         if (binds[i].fd < 0) die("open %s", binds[i].path);
     }
+    if (!host_network) loopback_up();
     build_root(cwd);
     for (i = 0; i < bind_count; i++) {
         if (binds[i].hide) continue;

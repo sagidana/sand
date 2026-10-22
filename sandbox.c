@@ -65,7 +65,8 @@ static const char *devices[] = {
  * Each is opened inside the new mount namespace before the staging tmpfs
  * hides anything, so paths under /tmp keep working. */
 struct bind {
-    char *path;
+    char *path;      /* on the host */
+    char *dst;       /* inside the sandbox, normally the same */
     int read_only;
     int fd;
 };
@@ -190,7 +191,7 @@ static void add_bind(const struct bind *b)
     int fd;
 
     snprintf(src, sizeof(src), "/proc/self/fd/%d", b->fd);
-    snprintf(dst, sizeof(dst), STAGE "%s", b->path);
+    snprintf(dst, sizeof(dst), STAGE "%s", b->dst);
     if (fstat(b->fd, &st) < 0) die("stat %s", b->path);
 
     if (S_ISDIR(st.st_mode)) {
@@ -423,7 +424,39 @@ static void add_path(const char *arg, int read_only)
         die("refusing to bind the root directory");
     }
     binds[bind_count].path = path;
+    binds[bind_count].dst = path;
     binds[bind_count].read_only = read_only;
+    bind_count++;
+}
+
+/* /etc/resolv.conf is often a symlink to a file outside the system dirs
+ * (/run/systemd/resolve/stub-resolv.conf, /mnt/wsl/resolv.conf). Inside
+ * the sandbox that link would dangle and name lookup would fail. Bind the
+ * real file at the path the link points to, so the link resolves again. */
+static void add_resolv_conf(void)
+{
+    char link[PATH_MAX];
+    char *path;
+    char *dst;
+    ssize_t n;
+
+    n = readlink("/etc/resolv.conf", link, sizeof(link) - 1);
+    if (n < 0) return;
+    link[n] = '\0';
+
+    path = realpath("/etc/resolv.conf", NULL);
+    if (path == NULL) return;
+
+    if (link[0] == '/') {
+        dst = strdup(link);
+    } else {
+        if (asprintf(&dst, "/etc/%s", link) < 0) die("asprintf");
+    }
+    if (dst == NULL) die("strdup");
+
+    binds[bind_count].path = path;
+    binds[bind_count].dst = dst;
+    binds[bind_count].read_only = 1;
     bind_count++;
 }
 
@@ -490,6 +523,7 @@ int main(int argc, char **argv)
         die("refusing to sandbox the root directory");
     }
     add_path(cwd, 1);
+    add_resolv_conf();
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ro") == 0 && i + 1 < argc) {

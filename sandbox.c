@@ -6,7 +6,8 @@
  * It sees an empty root containing only:
  *   - the host's system directories (/usr /bin /sbin /lib /lib64 /etc), read-only
  *   - the current working directory, read-only, at its own path
- *   - any extra paths given with --ro or --rw, at their own paths
+ *   - any extra paths given with --ro or --rw, at their own paths,
+ *     minus anything given with --hide
  *   - a fresh /tmp, a fresh /proc, and a minimal /dev
  * By default it has no network: the new net namespace holds nothing but
  * a down loopback. --net host keeps the host's network instead, and
@@ -83,8 +84,14 @@ struct bind {
     char *path;      /* on the host */
     char *dst;       /* inside the sandbox, normally the same */
     int read_only;
+    int hide;        /* cover dst with something empty instead */
     int fd;
 };
+
+/* Empty file bound over files to hide them. It lives on the /dev tmpfs:
+ * the root tmpfs cannot be remounted read-only while it holds an
+ * unlinked inode that is still in use. */
+#define EMPTY_FILE STAGE "/dev/.empty"
 
 #define MAX_BINDS 64
 
@@ -219,6 +226,23 @@ static void add_system_dir(const char *dir)
     bind_path(dir, dst, 1);
 }
 
+/* Cover a path that is visible in the staged root with an empty
+ * read-only directory or an empty file. A path that is not visible
+ * needs nothing. */
+static void hide_path(const char *path)
+{
+    char dst[STAGED_MAX];
+    struct stat st;
+
+    snprintf(dst, sizeof(dst), STAGE "%s", path);
+    if (stat(dst, &st) < 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        if (mount("tmpfs", dst, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV, "mode=755") < 0) die("hide %s", path);
+        return;
+    }
+    bind_path(EMPTY_FILE, dst, 1);
+}
+
 static void add_bind(const struct bind *b)
 {
     char src[PATH_MAX];
@@ -226,6 +250,11 @@ static void add_bind(const struct bind *b)
     char *slash;
     struct stat st;
     int fd;
+
+    if (b->hide) {
+        hide_path(b->dst);
+        return;
+    }
 
     snprintf(src, sizeof(src), "/proc/self/fd/%d", b->fd);
     snprintf(dst, sizeof(dst), STAGE "%s", b->dst);
@@ -277,6 +306,7 @@ static void build_root(const char *cwd)
 {
     const char **dir;
     int i;
+    int fd;
 
     /* Keep every mount change private to this namespace. */
     if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) die("make / private");
@@ -298,9 +328,14 @@ static void build_root(const char *cwd)
 
     /* User paths go in after the system dirs so that a --rw under /usr
      * or /etc lands on top of the read-only bind instead of under it. */
+    fd = open(EMPTY_FILE, O_WRONLY | O_CREAT, 0444);
+    if (fd < 0) die("create %s", EMPTY_FILE);
+    close(fd);
     for (i = 0; i < bind_count; i++) {
         add_bind(&binds[i]);
     }
+    /* The hidden files keep the inode; the name can go. */
+    if (unlink(EMPTY_FILE) < 0) die("unlink %s", EMPTY_FILE);
 
     /* Swap the staged tree in as root and drop the old one. */
     make_dirs(STAGE "/oldroot");
@@ -854,11 +889,13 @@ static int run_init(const char *cwd)
     /* Opened here, inside the new mount namespace: the kernel refuses to
      * bind from an fd that belongs to another namespace. */
     for (i = 0; i < bind_count; i++) {
+        if (binds[i].hide) continue;
         binds[i].fd = open(binds[i].path, O_PATH);
         if (binds[i].fd < 0) die("open %s", binds[i].path);
     }
     build_root(cwd);
     for (i = 0; i < bind_count; i++) {
+        if (binds[i].hide) continue;
         close(binds[i].fd);
     }
     if (sethostname("sandbox", 7) < 0) die("sethostname");
@@ -917,7 +954,7 @@ static void enter_namespaces(void)
     write_file("/proc/self/uid_map", map);
 }
 
-static void add_path(const char *arg, int read_only)
+static void add_path(const char *arg, int read_only, int hide)
 {
     char *path;
 
@@ -934,6 +971,7 @@ static void add_path(const char *arg, int read_only)
     binds[bind_count].path = path;
     binds[bind_count].dst = path;
     binds[bind_count].read_only = read_only;
+    binds[bind_count].hide = hide;
     bind_count++;
 }
 
@@ -1120,9 +1158,10 @@ static void set_net(const char *arg)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: sandbox [--ro PATH | --rw PATH | --env NAME[=VALUE] | --net MODE]... [-- COMMAND [ARG]...]\n");
+    fprintf(stderr, "usage: sandbox [--ro PATH | --rw PATH | --hide PATH | --env NAME[=VALUE] | --net MODE]... [-- COMMAND [ARG]...]\n");
     fprintf(stderr, "  --ro PATH          also make PATH visible, read-only\n");
     fprintf(stderr, "  --rw PATH          also make PATH visible, writable\n");
+    fprintf(stderr, "  --hide PATH        make a visible PATH appear empty\n");
     fprintf(stderr, "  --env NAME         pass the host's NAME through to the command\n");
     fprintf(stderr, "  --env NAME=VALUE   set NAME for the command\n");
     fprintf(stderr, "  --net none|host    no network (default), or the host's network\n");
@@ -1149,18 +1188,23 @@ int main(int argc, char **argv)
         errno = 0;
         die("refusing to sandbox the root directory");
     }
-    add_path(cwd, 1);
+    add_path(cwd, 1, 0);
     add_resolv_conf();
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ro") == 0 && i + 1 < argc) {
             i++;
-            add_path(argv[i], 1);
+            add_path(argv[i], 1, 0);
             continue;
         }
         if (strcmp(argv[i], "--rw") == 0 && i + 1 < argc) {
             i++;
-            add_path(argv[i], 0);
+            add_path(argv[i], 0, 0);
+            continue;
+        }
+        if (strcmp(argv[i], "--hide") == 0 && i + 1 < argc) {
+            i++;
+            add_path(argv[i], 1, 1);
             continue;
         }
         if (strcmp(argv[i], "--env") == 0 && i + 1 < argc) {

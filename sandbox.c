@@ -5,6 +5,7 @@
  * It sees an empty root containing only:
  *   - the host's system directories (/usr /bin /sbin /lib /lib64 /etc), read-only
  *   - the current working directory, read-only, at its own path
+ *   - any extra paths given with --ro, read-only, at their own paths
  *   - a fresh /tmp, a fresh /proc, and a minimal /dev
  * It has no network: the new net namespace holds nothing but a down loopback.
  *
@@ -56,6 +57,19 @@ static const char *devices[] = {
     "tty",
     NULL,
 };
+
+/* Host paths bound read-only into the sandbox: the cwd plus every --ro.
+ * Each is opened inside the new mount namespace before the staging tmpfs
+ * hides anything, so paths under /tmp keep working. */
+struct bind {
+    char *path;
+    int fd;
+};
+
+#define MAX_BINDS 64
+
+static struct bind binds[MAX_BINDS];
+static int bind_count = 0;
 
 /* The process that signals get forwarded to. */
 static pid_t forward_to = 0;
@@ -150,16 +164,30 @@ static void add_system_dir(const char *dir)
     bind_read_only(dir, dst);
 }
 
-/* The working directory is bound from an fd opened before the staging
- * tmpfs was mounted, so it still works when the cwd lives under /tmp. */
-static void add_cwd(const char *cwd, int cwd_fd)
+static void add_bind(const struct bind *b)
 {
     char src[PATH_MAX];
     char dst[STAGED_MAX];
+    char *slash;
+    struct stat st;
+    int fd;
 
-    snprintf(src, sizeof(src), "/proc/self/fd/%d", cwd_fd);
-    snprintf(dst, sizeof(dst), STAGE "%s", cwd);
-    make_dirs(dst);
+    snprintf(src, sizeof(src), "/proc/self/fd/%d", b->fd);
+    snprintf(dst, sizeof(dst), STAGE "%s", b->path);
+    if (fstat(b->fd, &st) < 0) die("stat %s", b->path);
+
+    if (S_ISDIR(st.st_mode)) {
+        make_dirs(dst);
+    } else {
+        /* A file is bound onto an empty file of the same name. */
+        slash = strrchr(dst, '/');
+        *slash = '\0';
+        make_dirs(dst);
+        *slash = '/';
+        fd = open(dst, O_WRONLY | O_CREAT, 0644);
+        if (fd < 0) die("create %s", dst);
+        close(fd);
+    }
     bind_read_only(src, dst);
 }
 
@@ -188,9 +216,10 @@ static void add_dev(void)
 }
 
 /* Runs as pid 1 inside the new namespaces, before the shell starts. */
-static void build_root(const char *cwd, int cwd_fd)
+static void build_root(const char *cwd)
 {
     const char **dir;
+    int i;
 
     /* Keep every mount change private to this namespace. */
     if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) die("make / private");
@@ -206,9 +235,11 @@ static void build_root(const char *cwd, int cwd_fd)
     make_dirs(STAGE "/dev");
     add_dev();
 
-    /* The cwd goes in before the system dirs: if it lives under one of
-     * them, the system dir bind simply covers it with the same content. */
-    add_cwd(cwd, cwd_fd);
+    /* The cwd and --ro paths go in before the system dirs: if one lives
+     * under a system dir, that bind simply covers it with the same content. */
+    for (i = 0; i < bind_count; i++) {
+        add_bind(&binds[i]);
+    }
 
     for (dir = system_dirs; *dir != NULL; dir++) {
         add_system_dir(*dir);
@@ -295,14 +326,18 @@ static int run_init(const char *cwd)
     pid_t shell;
     pid_t pid;
     int status;
-    int cwd_fd;
+    int i;
 
     /* Opened here, inside the new mount namespace: the kernel refuses to
-     * bind from a directory fd that belongs to another namespace. */
-    cwd_fd = open(".", O_RDONLY | O_DIRECTORY);
-    if (cwd_fd < 0) die("open cwd");
-    build_root(cwd, cwd_fd);
-    close(cwd_fd);
+     * bind from an fd that belongs to another namespace. */
+    for (i = 0; i < bind_count; i++) {
+        binds[i].fd = open(binds[i].path, O_PATH);
+        if (binds[i].fd < 0) die("open %s", binds[i].path);
+    }
+    build_root(cwd);
+    for (i = 0; i < bind_count; i++) {
+        close(binds[i].fd);
+    }
     if (sethostname("sandbox", 7) < 0) die("sethostname");
 
     shell = fork();
@@ -340,17 +375,53 @@ static void enter_namespaces(void)
     write_file("/proc/self/uid_map", map);
 }
 
-int main(void)
+static void add_ro_path(const char *arg)
+{
+    char *path;
+
+    if (bind_count == MAX_BINDS) {
+        errno = 0;
+        die("too many --ro paths (max %d)", MAX_BINDS);
+    }
+    path = realpath(arg, NULL);
+    if (path == NULL) die("%s", arg);
+    if (strcmp(path, "/") == 0) {
+        errno = 0;
+        die("refusing to bind the root directory");
+    }
+    binds[bind_count].path = path;
+    bind_count++;
+}
+
+static void usage(void)
+{
+    fprintf(stderr, "usage: sandbox [--ro PATH]...\n");
+    fprintf(stderr, "  --ro PATH   also make PATH visible, read-only (may repeat)\n");
+    exit(2);
+}
+
+int main(int argc, char **argv)
 {
     char cwd[PATH_MAX];
     pid_t init;
     pid_t pid;
     int status;
+    int i;
 
     if (getcwd(cwd, sizeof(cwd)) == NULL) die("getcwd");
     if (strcmp(cwd, "/") == 0) {
         errno = 0;
         die("refusing to sandbox the root directory");
+    }
+    add_ro_path(cwd);
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ro") == 0 && i + 1 < argc) {
+            i++;
+            add_ro_path(argv[i]);
+            continue;
+        }
+        usage();
     }
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) die("no_new_privs");

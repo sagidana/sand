@@ -1,5 +1,6 @@
 /*
- * sandbox - open a shell in the current directory with restrictions.
+ * sandbox - run a command (default: a shell) in the current directory
+ * with restrictions.
  *
  * The shell runs in its own user, mount, pid, net, ipc and uts namespaces.
  * It sees an empty root containing only:
@@ -10,8 +11,8 @@
  * It has no network: the new net namespace holds nothing but a down loopback.
  *
  * Process layout:
- *   sandbox (host)  ->  init (pid 1 in the sandbox)  ->  shell
- * init reaps orphans and forwards SIGTERM/SIGHUP to the shell.
+ *   sandbox (host)  ->  init (pid 1 in the sandbox)  ->  command
+ * init reaps orphans and forwards SIGTERM/SIGHUP to the command.
  */
 
 #define _GNU_SOURCE
@@ -72,6 +73,15 @@ struct bind {
 
 static struct bind binds[MAX_BINDS];
 static int bind_count = 0;
+
+/* The command to run, NULL-terminated argv; empty means the shell. */
+static char **command = NULL;
+
+/* Extra environment entries from --env, as "NAME=VALUE" strings. */
+#define MAX_ENV 64
+
+static char *extra_env[MAX_ENV];
+static int extra_env_count = 0;
 
 /* The process that signals get forwarded to. */
 static pid_t forward_to = 0;
@@ -289,9 +299,10 @@ static int exit_status(int status)
     return 1;
 }
 
-/* Environment variables the shell is allowed to inherit from the host.
- * Everything else is dropped: the host environment may hold secrets, and
- * prompt hooks pointing at files that do not exist inside break the shell. */
+/* Environment variables the command inherits from the host by default.
+ * Everything else is dropped unless named with --env: the host environment
+ * may hold secrets, and prompt hooks pointing at files that do not exist
+ * inside break the shell. */
 static const char *kept_env[] = {
     "PATH",
     "TERM",
@@ -302,13 +313,14 @@ static const char *kept_env[] = {
     NULL,
 };
 
-static void run_shell(void)
+static void run_command(void)
 {
     const char *shell = getenv("SHELL");
     const char **name;
     const char *value;
-    char *env[16];
+    char *env[16 + MAX_ENV];
     int n = 0;
+    int i;
 
     for (name = kept_env; *name != NULL; name++) {
         value = getenv(*name);
@@ -316,19 +328,30 @@ static void run_shell(void)
         if (asprintf(&env[n], "%s=%s", *name, value) < 0) die("asprintf");
         n++;
     }
+    for (i = 0; i < extra_env_count; i++) {
+        env[n] = extra_env[i];
+        n++;
+    }
     env[n] = "SANDBOX=1";
     n++;
     env[n] = NULL;
 
+    if (command != NULL) {
+        execvpe(command[0], command, env);
+        /* Same codes a shell uses, so callers can tell these apart. */
+        fprintf(stderr, "sandbox: %s: %s\n", command[0], strerror(errno));
+        if (errno == ENOENT) exit(127);
+        exit(126);
+    }
     if (shell != NULL) execle(shell, shell, (char *)NULL, env);
     execle("/bin/sh", "/bin/sh", (char *)NULL, env);
     die("exec shell");
 }
 
-/* pid 1 inside the sandbox: start the shell, reap, exit when it exits. */
+/* pid 1 inside the sandbox: start the command, reap, exit when it exits. */
 static int run_init(const char *cwd)
 {
-    pid_t shell;
+    pid_t child;
     pid_t pid;
     int status;
     int i;
@@ -345,11 +368,11 @@ static int run_init(const char *cwd)
     }
     if (sethostname("sandbox", 7) < 0) die("sethostname");
 
-    shell = fork();
-    if (shell < 0) die("fork");
-    if (shell == 0) run_shell();
+    child = fork();
+    if (child < 0) die("fork");
+    if (child == 0) run_command();
 
-    forward_to = shell;
+    forward_to = child;
     install_signal_handlers();
 
     for (;;) {
@@ -358,7 +381,7 @@ static int run_init(const char *cwd)
             if (errno == EINTR) continue;
             die("wait");
         }
-        if (pid == shell) break;
+        if (pid == child) break;
     }
     return exit_status(status);
 }
@@ -399,11 +422,36 @@ static void add_path(const char *arg, int read_only)
     bind_count++;
 }
 
+/* --env NAME passes the host's value through, --env NAME=VALUE sets one. */
+static void add_env(const char *arg)
+{
+    const char *value;
+    char *entry;
+
+    if (extra_env_count == MAX_ENV) {
+        errno = 0;
+        die("too many --env entries (max %d)", MAX_ENV);
+    }
+    if (strchr(arg, '=') != NULL) {
+        entry = strdup(arg);
+        if (entry == NULL) die("strdup");
+    } else {
+        value = getenv(arg);
+        if (value == NULL) return;
+        if (asprintf(&entry, "%s=%s", arg, value) < 0) die("asprintf");
+    }
+    extra_env[extra_env_count] = entry;
+    extra_env_count++;
+}
+
 static void usage(void)
 {
-    fprintf(stderr, "usage: sandbox [--ro PATH | --rw PATH]...\n");
-    fprintf(stderr, "  --ro PATH   also make PATH visible, read-only\n");
-    fprintf(stderr, "  --rw PATH   also make PATH visible, writable\n");
+    fprintf(stderr, "usage: sandbox [--ro PATH | --rw PATH | --env NAME[=VALUE]]... [-- COMMAND [ARG]...]\n");
+    fprintf(stderr, "  --ro PATH          also make PATH visible, read-only\n");
+    fprintf(stderr, "  --rw PATH          also make PATH visible, writable\n");
+    fprintf(stderr, "  --env NAME         pass the host's NAME through to the command\n");
+    fprintf(stderr, "  --env NAME=VALUE   set NAME for the command\n");
+    fprintf(stderr, "  -- COMMAND         run COMMAND instead of $SHELL\n");
     fprintf(stderr, "Flags may repeat; a later flag wins. Use --rw . for a writable cwd.\n");
     exit(2);
 }
@@ -433,6 +481,16 @@ int main(int argc, char **argv)
             i++;
             add_path(argv[i], 0);
             continue;
+        }
+        if (strcmp(argv[i], "--env") == 0 && i + 1 < argc) {
+            i++;
+            add_env(argv[i]);
+            continue;
+        }
+        if (strcmp(argv[i], "--") == 0) {
+            if (i + 1 == argc) usage();
+            command = argv + i + 1;
+            break;
         }
         usage();
     }

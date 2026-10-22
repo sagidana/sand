@@ -8,7 +8,8 @@
  *   - the current working directory, read-only, at its own path
  *   - any extra paths given with --ro or --rw, at their own paths
  *   - a fresh /tmp, a fresh /proc, and a minimal /dev
- * It has no network: the new net namespace holds nothing but a down loopback.
+ * By default it has no network: the new net namespace holds nothing but
+ * a down loopback. --net host keeps the host's network instead.
  *
  * Process layout:
  *   sandbox (host)  ->  init (pid 1 in the sandbox)  ->  command
@@ -76,6 +77,9 @@ static int bind_count = 0;
 
 /* The command to run, NULL-terminated argv; empty means the shell. */
 static char **command = NULL;
+
+/* --net host: stay in the host's network namespace. */
+static int host_network = 0;
 
 /* Extra environment entries from --env, as "NAME=VALUE" strings. */
 #define MAX_ENV 64
@@ -391,8 +395,9 @@ static void enter_namespaces(void)
     uid_t uid = getuid();
     gid_t gid = getgid();
     char map[64];
-    int flags = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS;
+    int flags = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS;
 
+    if (!host_network) flags |= CLONE_NEWNET;
     if (unshare(flags) < 0) die("unshare (are unprivileged user namespaces enabled?)");
 
     /* Map our own uid/gid to the same numbers inside. */
@@ -444,13 +449,28 @@ static void add_env(const char *arg)
     extra_env_count++;
 }
 
+static void set_net(const char *arg)
+{
+    if (strcmp(arg, "none") == 0) {
+        host_network = 0;
+        return;
+    }
+    if (strcmp(arg, "host") == 0) {
+        host_network = 1;
+        return;
+    }
+    errno = 0;
+    die("--net: expected none or host, got %s", arg);
+}
+
 static void usage(void)
 {
-    fprintf(stderr, "usage: sandbox [--ro PATH | --rw PATH | --env NAME[=VALUE]]... [-- COMMAND [ARG]...]\n");
+    fprintf(stderr, "usage: sandbox [--ro PATH | --rw PATH | --env NAME[=VALUE] | --net MODE]... [-- COMMAND [ARG]...]\n");
     fprintf(stderr, "  --ro PATH          also make PATH visible, read-only\n");
     fprintf(stderr, "  --rw PATH          also make PATH visible, writable\n");
     fprintf(stderr, "  --env NAME         pass the host's NAME through to the command\n");
     fprintf(stderr, "  --env NAME=VALUE   set NAME for the command\n");
+    fprintf(stderr, "  --net none|host    no network (default), or the host's network\n");
     fprintf(stderr, "  -- COMMAND         run COMMAND instead of $SHELL\n");
     fprintf(stderr, "Flags may repeat; a later flag wins. Use --rw . for a writable cwd.\n");
     exit(2);
@@ -485,6 +505,11 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--env") == 0 && i + 1 < argc) {
             i++;
             add_env(argv[i]);
+            continue;
+        }
+        if (strcmp(argv[i], "--net") == 0 && i + 1 < argc) {
+            i++;
+            set_net(argv[i]);
             continue;
         }
         if (strcmp(argv[i], "--") == 0) {

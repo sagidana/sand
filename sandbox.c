@@ -253,13 +253,39 @@ static int exit_status(int status)
     return 1;
 }
 
+/* Environment variables the shell is allowed to inherit from the host.
+ * Everything else is dropped: the host environment may hold secrets, and
+ * prompt hooks pointing at files that do not exist inside break the shell. */
+static const char *kept_env[] = {
+    "PATH",
+    "TERM",
+    "HOME",
+    "USER",
+    "LANG",
+    "SHELL",
+    NULL,
+};
+
 static void run_shell(void)
 {
     const char *shell = getenv("SHELL");
+    const char **name;
+    const char *value;
+    char *env[16];
+    int n = 0;
 
-    setenv("SANDBOX", "1", 1);
-    if (shell != NULL) execl(shell, shell, (char *)NULL);
-    execl("/bin/sh", "/bin/sh", (char *)NULL);
+    for (name = kept_env; *name != NULL; name++) {
+        value = getenv(*name);
+        if (value == NULL) continue;
+        if (asprintf(&env[n], "%s=%s", *name, value) < 0) die("asprintf");
+        n++;
+    }
+    env[n] = "SANDBOX=1";
+    n++;
+    env[n] = NULL;
+
+    if (shell != NULL) execle(shell, shell, (char *)NULL, env);
+    execle("/bin/sh", "/bin/sh", (char *)NULL, env);
     die("exec shell");
 }
 

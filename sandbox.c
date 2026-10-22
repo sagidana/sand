@@ -5,7 +5,7 @@
  * It sees an empty root containing only:
  *   - the host's system directories (/usr /bin /sbin /lib /lib64 /etc), read-only
  *   - the current working directory, read-only, at its own path
- *   - any extra paths given with --ro, read-only, at their own paths
+ *   - any extra paths given with --ro or --rw, at their own paths
  *   - a fresh /tmp, a fresh /proc, and a minimal /dev
  * It has no network: the new net namespace holds nothing but a down loopback.
  *
@@ -58,11 +58,13 @@ static const char *devices[] = {
     NULL,
 };
 
-/* Host paths bound read-only into the sandbox: the cwd plus every --ro.
+/* Host paths bound into the sandbox: the cwd plus every --ro and --rw,
+ * in command line order, so a later flag wins over an earlier one.
  * Each is opened inside the new mount namespace before the staging tmpfs
  * hides anything, so paths under /tmp keep working. */
 struct bind {
     char *path;
+    int read_only;
     int fd;
 };
 
@@ -125,18 +127,19 @@ struct mount_attr_args {
 #define ATTR_NOSUID 0x02
 #define AT_RECURSIVE_FLAG 0x8000
 
-/* Bind src onto dst recursively, then make the whole subtree read-only.
+/* Bind src onto dst recursively, then set flags on the whole subtree.
  * Recursive is required: inside a user namespace the kernel refuses a
  * plain bind of a directory that has locked submounts under it. */
-static void bind_read_only(const char *src, const char *dst)
+static void bind_path(const char *src, const char *dst, int read_only)
 {
     struct mount_attr_args attr;
 
     if (mount(src, dst, NULL, MS_BIND | MS_REC, NULL) < 0) die("bind %s", src);
 
     memset(&attr, 0, sizeof(attr));
-    attr.attr_set = ATTR_RDONLY | ATTR_NOSUID;
-    if (syscall(SYS_mount_setattr, AT_FDCWD, dst, AT_RECURSIVE_FLAG, &attr, sizeof(attr)) < 0) die("make %s read-only", dst);
+    attr.attr_set = ATTR_NOSUID;
+    if (read_only) attr.attr_set |= ATTR_RDONLY;
+    if (syscall(SYS_mount_setattr, AT_FDCWD, dst, AT_RECURSIVE_FLAG, &attr, sizeof(attr)) < 0) die("set flags on %s", dst);
 }
 
 /* Add one host system directory to the staged root.
@@ -161,7 +164,7 @@ static void add_system_dir(const char *dir)
     }
 
     make_dirs(dst);
-    bind_read_only(dir, dst);
+    bind_path(dir, dst, 1);
 }
 
 static void add_bind(const struct bind *b)
@@ -179,16 +182,18 @@ static void add_bind(const struct bind *b)
     if (S_ISDIR(st.st_mode)) {
         make_dirs(dst);
     } else {
-        /* A file is bound onto an empty file of the same name. */
+        /* A file is bound onto an empty file of the same name.
+         * Opened read-only so an existing file on a read-only bind
+         * (for example under /etc) is accepted as the mount point. */
         slash = strrchr(dst, '/');
         *slash = '\0';
         make_dirs(dst);
         *slash = '/';
-        fd = open(dst, O_WRONLY | O_CREAT, 0644);
+        fd = open(dst, O_RDONLY | O_CREAT, 0644);
         if (fd < 0) die("create %s", dst);
         close(fd);
     }
-    bind_read_only(src, dst);
+    bind_path(src, dst, b->read_only);
 }
 
 static void add_dev(void)
@@ -235,14 +240,14 @@ static void build_root(const char *cwd)
     make_dirs(STAGE "/dev");
     add_dev();
 
-    /* The cwd and --ro paths go in before the system dirs: if one lives
-     * under a system dir, that bind simply covers it with the same content. */
-    for (i = 0; i < bind_count; i++) {
-        add_bind(&binds[i]);
-    }
-
     for (dir = system_dirs; *dir != NULL; dir++) {
         add_system_dir(*dir);
+    }
+
+    /* User paths go in after the system dirs so that a --rw under /usr
+     * or /etc lands on top of the read-only bind instead of under it. */
+    for (i = 0; i < bind_count; i++) {
+        add_bind(&binds[i]);
     }
 
     /* Swap the staged tree in as root and drop the old one. */
@@ -375,13 +380,13 @@ static void enter_namespaces(void)
     write_file("/proc/self/uid_map", map);
 }
 
-static void add_ro_path(const char *arg)
+static void add_path(const char *arg, int read_only)
 {
     char *path;
 
     if (bind_count == MAX_BINDS) {
         errno = 0;
-        die("too many --ro paths (max %d)", MAX_BINDS);
+        die("too many paths (max %d)", MAX_BINDS);
     }
     path = realpath(arg, NULL);
     if (path == NULL) die("%s", arg);
@@ -390,13 +395,16 @@ static void add_ro_path(const char *arg)
         die("refusing to bind the root directory");
     }
     binds[bind_count].path = path;
+    binds[bind_count].read_only = read_only;
     bind_count++;
 }
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: sandbox [--ro PATH]...\n");
-    fprintf(stderr, "  --ro PATH   also make PATH visible, read-only (may repeat)\n");
+    fprintf(stderr, "usage: sandbox [--ro PATH | --rw PATH]...\n");
+    fprintf(stderr, "  --ro PATH   also make PATH visible, read-only\n");
+    fprintf(stderr, "  --rw PATH   also make PATH visible, writable\n");
+    fprintf(stderr, "Flags may repeat; a later flag wins. Use --rw . for a writable cwd.\n");
     exit(2);
 }
 
@@ -413,12 +421,17 @@ int main(int argc, char **argv)
         errno = 0;
         die("refusing to sandbox the root directory");
     }
-    add_ro_path(cwd);
+    add_path(cwd, 1);
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ro") == 0 && i + 1 < argc) {
             i++;
-            add_ro_path(argv[i]);
+            add_path(argv[i], 1);
+            continue;
+        }
+        if (strcmp(argv[i], "--rw") == 0 && i + 1 < argc) {
+            i++;
+            add_path(argv[i], 0);
             continue;
         }
         usage();

@@ -126,6 +126,7 @@ host, built once with root by `sand-net`, and joined by `sand` without
 it.
 
     sudo sand-net create work            # for the user running sudo
+    sudo sand-net create pip --allow :443
     sand --net work curl https://example.com
     sand-net list
     sudo sand-net delete work
@@ -141,8 +142,8 @@ What `create` builds: a user namespace owned by the user with the
 network namespace inside it, both kept alive by bind mounts under
 `/var/lib/sand/net/NAME`; a veth pair with one end inside and one on
 the host, named `sand-NAME`, on a `/30` from `10.44.0.0/16`;
-forwarding; and one nft table `sand` holding the masquerade for every
-network. The ownership is what lets `sand` join without root: the
+forwarding; and one nft table `sand` holding the masquerade and the
+rules for every network. The ownership is what lets `sand` join without root: the
 owner of a user namespace has every capability in it, including the
 one needed to enter the network namespace. The command then runs one
 namespace deeper, with no capability over the network. On a host with
@@ -159,9 +160,40 @@ network. If some other tool flushes the firewall or turns forwarding
 off, the networks lose their way out until the next `up`, and never
 gain more than they had.
 
+### Rules
+
+A network can be narrowed to the addresses and ports a job needs:
+
+    sudo sand-net create pip --allow :443
+    sudo sand-net create lan --allow 10.0.0.0/8 --block 10.1.0.0/16
+    sudo sand-net create mail --block :25
+
+    RULE = [ADDR[/PREFIX]][:PORT[-PORT]] | all
+
+    1.1.1.1              one address, any port
+    10.0.0.0/8:443       a range, one port
+    :53                  any address, one port
+    8000-9000            any address, a port range
+    [2001:db8::1]:80     IPv6 with a port needs brackets
+
+Rules apply in order and a later rule wins. As soon as any `--allow`
+is given, everything not allowed is blocked. A rule with a port covers
+TCP and UDP; one without covers everything, ping included. The
+network's resolvers are always allowed on port 53, so a rule list
+never has to mention DNS. A blocked connection is rejected, so a
+program sees "connection refused" at once rather than a hang.
+Networks cannot reach each other, and the host itself is subject to
+the same rules as the rest of the world.
+
+The rules are part of the network, not of the sandbox: they are nft
+rules on the host end of the veth, owned by root, and nothing inside
+can loosen them. `sand-net list` shows them, `sand-net nft` prints the
+whole table as `up` loads it, and to change them delete the network
+and create it again. Rules match addresses, not names; filtering by
+domain is not provided.
+
 `sand-net` runs `ip` and `nft`, and `iptables` where Docker is
-present. Filtering by address and port is the next step and will be
-part of the network, not of `sand`.
+present.
 
 ## Nesting
 
@@ -189,8 +221,9 @@ grow. There is no wall-clock timeout either; use `timeout(1)` in front.
 Real limits need cgroups, which an unprivileged process only gets when
 the system delegates a cgroup to it.
 
-Network filtering. A network built by `sand-net` reaches everything
-the host does; rules by address, port or name on it come next.
+Domain-based network rules. Rules on a network match addresses, not
+names. Filtering by domain needs a resolver inside the network that
+only answers allowed names and feeds the addresses into the rules.
 
 Root inside. The command runs as your own user, not as root in a user
 namespace. `apt install`, `chown` to another user, `mknod`, mounting

@@ -3,12 +3,14 @@
  * out through the host, built once with root, joined by sand without.
  *
  *   sudo sand-net create NAME [--dns ADDR]... [--owner USER]
+ *                         [--allow RULE]... [--block RULE]...
  *   sudo sand-net up [NAME]        rebuild whatever is missing, e.g. after a reboot
  *   sudo sand-net delete NAME
  *        sand-net list
+ *        sand-net nft              print the firewall table that up would load
  *
  * State lives in /var/lib/sand/net/NAME:
- *   config       owner, subnet number, dns servers
+ *   config       owner, subnet number, dns servers, rules
  *   user, net    the namespaces, bind-mounted so they outlive their maker
  *   resolv.conf  what sand binds over /etc/resolv.conf inside
  *
@@ -18,8 +20,10 @@
  * then runs one namespace deeper, with no capability over the network.
  * Root is for the host side only: a veth pair with one end inside
  * (eth0, 10.44.N.2/30) and one on the host (sand-NAME, 10.44.N.1/30),
- * forwarding, and one nft table `sand` with a masquerade per network,
- * rebuilt from every config on each up. With Docker on the host, an
+ * forwarding, and one nft table `sand` with a masquerade and a chain
+ * of rules per network, rebuilt from every config on each up. The
+ * rules sit on the host end of the veth, out of the sandbox's reach:
+ * nothing inside can loosen them. With Docker on the host, an
  * accept for the veth in its DOCKER-USER chain, since Docker drops
  * forwarded traffic by default.
  *
@@ -40,6 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
@@ -53,6 +58,21 @@
 #define MAX_NAME 10
 #define MAX_DNS 8
 #define MAX_NETS 254
+#define MAX_RULES 64
+
+/* Where the configs live; the tests point SAND_NET_STATE elsewhere. */
+static const char *state = STATE;
+
+/* RULE = [ADDR[/PREFIX]][:PORT[-PORT]] | all; kept as written. */
+struct rule {
+    int allow;
+    char text[64];
+    int family;             /* AF_INET, AF_INET6, or 0 for any address */
+    unsigned char addr[16];
+    int prefix;
+    int port_lo;            /* 0-65535 when ports are given, else -1 */
+    int port_hi;
+};
 
 struct net {
     char name[MAX_NAME + 1];
@@ -60,6 +80,8 @@ struct net {
     int index;              /* N in 10.44.N.0/30 */
     char dns[MAX_DNS][64];
     int dns_count;
+    struct rule rules[MAX_RULES];
+    int rule_count;
 };
 
 static void report(const char *fmt, va_list ap, int saved_errno)
@@ -101,7 +123,7 @@ static void write_file(const char *path, const char *text)
 
 static void state_path(char *buf, size_t size, const char *name, const char *file)
 {
-    snprintf(buf, size, STATE "/%s/%s", name, file);
+    snprintf(buf, size, "%s/%s/%s", state, name, file);
 }
 
 static void host_interface(char *buf, size_t size, const struct net *n)
@@ -113,6 +135,105 @@ static void check_name(const char *name)
 {
     if (name[0] == '\0' || strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(name)) fail("bad name: %s (letters, digits, _ and -)", name);
     if (strlen(name) > MAX_NAME) fail("%s: a name has at most %d characters (it becomes interface sand-NAME)", name, MAX_NAME);
+}
+
+/* ---- rules ---- */
+
+static int parse_number(const char *text, int lo, int hi, const char *what)
+{
+    char *end;
+    long value;
+
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (*text == '\0' || *end != '\0' || value < lo || value > hi) fail("bad %s: %s", what, text);
+    return value;
+}
+
+static void parse_address(char *text, struct rule *r)
+{
+    char *slash;
+    int max;
+
+    slash = strchr(text, '/');
+    if (slash != NULL) *slash = '\0';
+    if (inet_pton(AF_INET, text, r->addr) == 1) {
+        r->family = AF_INET;
+        max = 32;
+    } else if (inet_pton(AF_INET6, text, r->addr) == 1) {
+        r->family = AF_INET6;
+        max = 128;
+    } else {
+        fail("bad address: %s", text);
+    }
+    r->prefix = max;
+    if (slash != NULL) r->prefix = parse_number(slash + 1, 0, max, "prefix");
+}
+
+static void parse_ports(char *text, struct rule *r)
+{
+    char *dash = strchr(text, '-');
+
+    if (dash == NULL) {
+        r->port_lo = parse_number(text, 0, 65535, "port");
+        r->port_hi = r->port_lo;
+        return;
+    }
+    *dash = '\0';
+    r->port_lo = parse_number(text, 0, 65535, "port");
+    r->port_hi = parse_number(dash + 1, 0, 65535, "port");
+    if (r->port_lo > r->port_hi) fail("bad port range: %s-%s", text, dash + 1);
+}
+
+/* An IPv6 address followed by a port needs brackets: [2001:db8::1]:53.
+ * A bare number or range is a port: 443, 8000-9000. */
+static void add_rule(struct net *n, const char *arg, int allow)
+{
+    char text[sizeof(n->rules[0].text)];
+    char *p;
+    char *addr = NULL;
+    char *ports = NULL;
+    char *end;
+    struct rule *r;
+
+    if (n->rule_count == MAX_RULES) fail("%s: too many rules (max %d)", n->name, MAX_RULES);
+    if (strlen(arg) >= sizeof(text)) fail("bad rule: %s", arg);
+    r = &n->rules[n->rule_count];
+    memset(r, 0, sizeof(*r));
+    r->allow = allow;
+    r->port_lo = -1;
+    r->port_hi = -1;
+    snprintf(r->text, sizeof(r->text), "%s", arg);
+    if (strcmp(arg, "all") == 0) {
+        n->rule_count++;
+        return;
+    }
+
+    snprintf(text, sizeof(text), "%s", arg);
+    p = text;
+    if (*p == '[') {
+        addr = p + 1;
+        end = strchr(addr, ']');
+        if (end == NULL) fail("bad rule: %s", arg);
+        *end = '\0';
+        ports = end + 1;
+        if (*ports == ':') ports++;
+    } else if (strspn(p, "0123456789-") == strlen(p)) {
+        ports = p;
+    } else if (strchr(p, ':') != NULL && strchr(p, ':') != strrchr(p, ':')) {
+        addr = p;
+    } else {
+        addr = p;
+        end = strchr(p, ':');
+        if (end != NULL) {
+            *end = '\0';
+            ports = end + 1;
+        }
+    }
+    if (addr != NULL && *addr != '\0') parse_address(addr, r);
+    if (ports != NULL && *ports != '\0') parse_ports(ports, r);
+    if (r->family == 0 && r->port_lo < 0) fail("bad rule: %s", arg);
+    n->rule_count++;
 }
 
 /* ---- running programs ---- */
@@ -220,6 +341,7 @@ static void read_config(struct net *n)
     n->owner = 0;
     n->index = 0;
     n->dns_count = 0;
+    n->rule_count = 0;
     while ((len = getline(&line, &cap, f)) >= 0) {
         if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
         value = strchr(line, ' ');
@@ -232,6 +354,8 @@ static void read_config(struct net *n)
             snprintf(n->dns[n->dns_count], sizeof(n->dns[0]), "%s", value);
             n->dns_count++;
         }
+        if (strcmp(line, "allow") == 0) add_rule(n, value, 1);
+        if (strcmp(line, "block") == 0) add_rule(n, value, 0);
     }
     free(line);
     fclose(f);
@@ -257,6 +381,9 @@ static void write_config(const struct net *n)
     for (i = 0; i < n->dns_count; i++) {
         fprintf(f, "dns %s\n", n->dns[i]);
     }
+    for (i = 0; i < n->rule_count; i++) {
+        fprintf(f, "%s %s\n", n->rules[i].allow ? "allow" : "block", n->rules[i].text);
+    }
     if (fclose(f) != 0) die("write %s", path);
 
     state_path(path, sizeof(path), n->name, "resolv.conf");
@@ -272,18 +399,21 @@ static void write_config(const struct net *n)
 static int load_all(struct net *nets)
 {
     struct dirent **entries;
+    char path[PATH_MAX];
     int count;
     int found = 0;
     int i;
 
-    count = scandir(STATE, &entries, NULL, alphasort);
+    count = scandir(state, &entries, NULL, alphasort);
     if (count < 0 && errno == ENOENT) return 0;
-    if (count < 0) die("read " STATE);
+    if (count < 0) die("read %s", state);
     for (i = 0; i < count; i++) {
         if (entries[i]->d_name[0] == '.') continue;
         if (strlen(entries[i]->d_name) > MAX_NAME) continue;
+        snprintf(path, sizeof(path), "%s/%s/config", state, entries[i]->d_name);
+        if (access(path, F_OK) != 0) continue;
         if (found == MAX_NETS) fail("too many networks");
-        snprintf(nets[found].name, sizeof(nets[found].name), "%s", entries[i]->d_name);
+        snprintf(nets[found].name, sizeof(nets[found].name), "%.*s", MAX_NAME, entries[i]->d_name);
         read_config(&nets[found]);
         found++;
     }
@@ -476,22 +606,63 @@ static void host_side(const struct net *n)
     docker_accept(iface);
 }
 
+/* One nft rule: the match for a rule's address and ports, then the
+ * verdict. nft takes the first match, so the caller emits rules in
+ * reverse, which keeps "a later rule wins". */
+static void nft_rule(FILE *f, const struct rule *r)
+{
+    char addr[INET6_ADDRSTRLEN];
+
+    fprintf(f, "        ");
+    if (r->family != 0) {
+        inet_ntop(r->family, r->addr, addr, sizeof(addr));
+        fprintf(f, "%s daddr %s/%d ", r->family == AF_INET ? "ip" : "ip6", addr, r->prefix);
+    }
+    if (r->port_lo >= 0) {
+        fprintf(f, "meta l4proto { tcp, udp } th dport %d", r->port_lo);
+        if (r->port_hi != r->port_lo) fprintf(f, "-%d", r->port_hi);
+        fprintf(f, " ");
+    }
+    fprintf(f, "%s\n", r->allow ? "accept" : "reject");
+}
+
+/* The chain for one network: its resolvers on port 53, the rules
+ * last to first, and the default, closed as soon as anything is allowed. */
+static void nft_chain(FILE *f, const struct net *n)
+{
+    unsigned char addr[16];
+    int allowed = 0;
+    int i;
+
+    fprintf(f, "    chain net_%s {\n", n->name);
+    for (i = 0; i < n->dns_count; i++) {
+        if (inet_pton(AF_INET, n->dns[i], addr) == 1) {
+            fprintf(f, "        ip daddr %s meta l4proto { tcp, udp } th dport 53 accept\n", n->dns[i]);
+        } else {
+            fprintf(f, "        ip6 daddr %s meta l4proto { tcp, udp } th dport 53 accept\n", n->dns[i]);
+        }
+    }
+    for (i = n->rule_count - 1; i >= 0; i--) {
+        nft_rule(f, &n->rules[i]);
+        if (n->rules[i].allow) allowed = 1;
+    }
+    fprintf(f, "        %s\n", allowed ? "reject" : "accept");
+    fprintf(f, "    }\n");
+}
+
 /* The nft table is ours alone and is rebuilt whole from the configs:
- * the masquerade that gives each network its way out. Without the
+ * the masquerade that gives each network its way out and a chain of
+ * rules per network, judged on the host, where forwarded traffic and
+ * traffic to the host itself both arrive from the veth. Without the
  * table nothing gets out, so anything that flushes it fails closed. */
-static void apply_nft(const struct net *nets, int count)
+static char *nft_script(const struct net *nets, int count)
 {
     char *script;
     size_t size;
     FILE *f;
     char iface[32];
-    char *argv[] = { "nft", "-f", "-", NULL };
     int i;
 
-    if (count == 0) {
-        probe("nft", "delete", "table", "inet", "sand", NULL);
-        return;
-    }
     f = open_memstream(&script, &size);
     if (f == NULL) die("open_memstream");
     fprintf(f, "add table inet sand\n");
@@ -499,12 +670,24 @@ static void apply_nft(const struct net *nets, int count)
     fprintf(f, "table inet sand {\n");
     fprintf(f, "    chain forward {\n");
     fprintf(f, "        type filter hook forward priority 0; policy accept;\n");
+    fprintf(f, "        ct state established,related accept\n");
+    fprintf(f, "        iifname \"sand-*\" oifname \"sand-*\" reject\n");
     for (i = 0; i < count; i++) {
         host_interface(iface, sizeof(iface), &nets[i]);
-        fprintf(f, "        iifname \"%s\" accept\n", iface);
-        fprintf(f, "        oifname \"%s\" accept\n", iface);
+        fprintf(f, "        iifname \"%s\" jump net_%s\n", iface, nets[i].name);
     }
     fprintf(f, "    }\n");
+    fprintf(f, "    chain input {\n");
+    fprintf(f, "        type filter hook input priority 0; policy accept;\n");
+    fprintf(f, "        ct state established,related accept\n");
+    for (i = 0; i < count; i++) {
+        host_interface(iface, sizeof(iface), &nets[i]);
+        fprintf(f, "        iifname \"%s\" jump net_%s\n", iface, nets[i].name);
+    }
+    fprintf(f, "    }\n");
+    for (i = 0; i < count; i++) {
+        nft_chain(f, &nets[i]);
+    }
     fprintf(f, "    chain postrouting {\n");
     fprintf(f, "        type nat hook postrouting priority 100; policy accept;\n");
     for (i = 0; i < count; i++) {
@@ -514,6 +697,19 @@ static void apply_nft(const struct net *nets, int count)
     fprintf(f, "    }\n");
     fprintf(f, "}\n");
     if (fclose(f) != 0) die("build nft script");
+    return script;
+}
+
+static void apply_nft(const struct net *nets, int count)
+{
+    char *argv[] = { "nft", "-f", "-", NULL };
+    char *script;
+
+    if (count == 0) {
+        probe("nft", "delete", "table", "inet", "sand", NULL);
+        return;
+    }
+    script = nft_script(nets, count);
     if (run_status(-1, argv, script, 0) != 0) fail("nft failed");
     free(script);
 }
@@ -590,6 +786,10 @@ static void create(int argc, char **argv)
             n->dns_count++;
         } else if (strcmp(argv[i], "--owner") == 0) {
             owner = argv[i + 1];
+        } else if (strcmp(argv[i], "--allow") == 0) {
+            add_rule(n, argv[i + 1], 1);
+        } else if (strcmp(argv[i], "--block") == 0) {
+            add_rule(n, argv[i + 1], 0);
         } else {
             fail("create: unknown flag %s", argv[i]);
         }
@@ -599,9 +799,9 @@ static void create(int argc, char **argv)
     n->index = free_index(nets, count);
     if (n->dns_count == 0) default_dns(n);
 
-    make_dir("/var/lib/sand");
-    make_dir(STATE);
-    snprintf(path, sizeof(path), STATE "/%s", n->name);
+    if (strcmp(state, STATE) == 0) make_dir("/var/lib/sand");
+    make_dir(state);
+    snprintf(path, sizeof(path), "%s/%s", state, n->name);
     if (mkdir(path, 0755) < 0) die("mkdir %s", path);
     write_config(n);
     bring_up(n);
@@ -659,7 +859,7 @@ static void delete(int argc, char **argv)
     remove_file(n->name, "user");
     remove_file(n->name, "resolv.conf");
     remove_file(n->name, "config");
-    snprintf(path, sizeof(path), STATE "/%s", n->name);
+    snprintf(path, sizeof(path), "%s/%s", state, n->name);
     if (rmdir(path) < 0) die("remove %s", path);
     count = load_all(nets);
     apply_nft(nets, count);
@@ -674,6 +874,7 @@ static void list(void)
     const char *status;
     int count;
     int i;
+    int j;
 
     count = load_all(nets);
     for (i = 0; i < count; i++) {
@@ -684,22 +885,42 @@ static void list(void)
         owner = "?";
         if (pw != NULL) owner = pw->pw_name;
         printf("%-10s %-5s 10.44.%d.0/30  %s\n", nets[i].name, status, nets[i].index, owner);
+        for (j = 0; j < nets[i].rule_count; j++) {
+            printf("           %s %s\n", nets[i].rules[j].allow ? "allow" : "block", nets[i].rules[j].text);
+        }
     }
+}
+
+static void print_nft(void)
+{
+    static struct net nets[MAX_NETS];
+    char *script;
+    int count;
+
+    count = load_all(nets);
+    if (count == 0) return;
+    script = nft_script(nets, count);
+    fputs(script, stdout);
+    free(script);
 }
 
 static void usage(void)
 {
     fprintf(stderr, "usage: sudo sand-net create NAME [--dns ADDR]... [--owner USER]\n");
+    fprintf(stderr, "                             [--allow RULE]... [--block RULE]...\n");
     fprintf(stderr, "       sudo sand-net up [NAME]\n");
     fprintf(stderr, "       sudo sand-net delete NAME\n");
     fprintf(stderr, "            sand-net list\n");
+    fprintf(stderr, "            sand-net nft\n");
     fprintf(stderr, "A network is a namespace with a way out through the host; sand --net NAME joins it.\n");
-    fprintf(stderr, "up rebuilds what is missing, which after a reboot is everything.\n");
+    fprintf(stderr, "RULE = [ADDR[/PREFIX]][:PORT[-PORT]] | all, e.g. :443, 10.0.0.0/8, [2001:db8::1]:53.\n");
+    fprintf(stderr, "up rebuilds what is missing, which after a reboot is everything; nft prints its firewall table.\n");
     exit(2);
 }
 
 int main(int argc, char **argv)
 {
+    if (getenv("SAND_NET_STATE") != NULL) state = getenv("SAND_NET_STATE");
     if (argc < 2) usage();
     if (strcmp(argv[1], "create") == 0) {
         create(argc - 2, argv + 2);
@@ -709,6 +930,8 @@ int main(int argc, char **argv)
         delete(argc - 2, argv + 2);
     } else if (strcmp(argv[1], "list") == 0) {
         list();
+    } else if (strcmp(argv[1], "nft") == 0) {
+        print_nft();
     } else {
         usage();
     }

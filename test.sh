@@ -267,6 +267,71 @@ expect "sand-net create needs root" 1 "*needs root*" \
 expect "sand-net without a command gives usage" 2 "usage:*" \
     --ro "$SANDNET" "$SANDNET"
 
+# Rules become the nft table; sand-net nft prints it from the configs,
+# which the tests write by hand under their own state directory.
+mkdir -p "$T/state/work" "$T/state/open" "$T/badstate/bad" "$T/nostate"
+printf 'owner %d\nindex 1\ndns 1.1.1.1\ndns 2606:4700::1111\nallow :443\nblock 10.0.0.0/8\nallow [2001:db8::1]:53\nallow 192.168.1.0/24:8000-9000\n' "$(id -u)" > "$T/state/work/config"
+printf 'owner %d\nindex 2\ndns 9.9.9.9\nblock :25\n' "$(id -u)" > "$T/state/open/config"
+printf 'owner %d\nindex 1\nallow 1.2.3.4:99999\n' "$(id -u)" > "$T/badstate/bad/config"
+cat > "$T/nft.expected" <<'NFT'
+add table inet sand
+flush table inet sand
+table inet sand {
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        ct state established,related accept
+        iifname "sand-*" oifname "sand-*" reject
+        iifname "sand-open" jump net_open
+        iifname "sand-work" jump net_work
+    }
+    chain input {
+        type filter hook input priority 0; policy accept;
+        ct state established,related accept
+        iifname "sand-open" jump net_open
+        iifname "sand-work" jump net_work
+    }
+    chain net_open {
+        ip daddr 9.9.9.9 meta l4proto { tcp, udp } th dport 53 accept
+        meta l4proto { tcp, udp } th dport 25 reject
+        accept
+    }
+    chain net_work {
+        ip daddr 1.1.1.1 meta l4proto { tcp, udp } th dport 53 accept
+        ip6 daddr 2606:4700::1111 meta l4proto { tcp, udp } th dport 53 accept
+        ip daddr 192.168.1.0/24 meta l4proto { tcp, udp } th dport 8000-9000 accept
+        ip6 daddr 2001:db8::1/128 meta l4proto { tcp, udp } th dport 53 accept
+        ip daddr 10.0.0.0/8 reject
+        meta l4proto { tcp, udp } th dport 443 accept
+        reject
+    }
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        ip saddr 10.44.2.0/30 oifname != "sand-open" masquerade
+        ip saddr 10.44.1.0/30 oifname != "sand-work" masquerade
+    }
+}
+NFT
+if selected "sand-net nft translates the rules"; then
+    run --ro "$SANDNET" --ro "$T/state" --env "SAND_NET_STATE=$T/state" "$SANDNET" nft
+    if [ "$status" = 0 ] && [ "$out" = "$(cat "$T/nft.expected")" ]; then
+        ok "sand-net nft translates the rules"
+    else
+        bad "sand-net nft translates the rules" "exit $status; output: $out"
+    fi
+fi
+expect "sand-net nft without networks prints nothing" 0 "" \
+    --ro "$SANDNET" --ro "$T/nostate" --env "SAND_NET_STATE=$T/nostate" "$SANDNET" nft
+expect "sand-net refuses a bad rule in a config" 1 "*bad port: 99999*" \
+    --ro "$SANDNET" --ro "$T/badstate" --env "SAND_NET_STATE=$T/badstate" "$SANDNET" nft
+expect "sand-net list shows the rules" 0 "open*down*10.44.2.0/30*
+*block :25
+work*down*10.44.1.0/30*
+*allow :443
+*block 10.0.0.0/8
+*allow ?2001:db8::1?:53
+*allow 192.168.1.0/24:8000-9000" \
+    --ro "$SANDNET" --ro "$T/state" --env "SAND_NET_STATE=$T/state" "$SANDNET" list
+
 # --- nesting ----------------------------------------------------------
 
 expect "sand inside sand" 0 "inner" \

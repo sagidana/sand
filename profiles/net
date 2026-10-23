@@ -1,0 +1,4 @@
+# host network, but only name lookup and https
+net host
+allow :53
+allow :443

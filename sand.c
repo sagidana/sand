@@ -984,15 +984,41 @@ static void enter_namespaces(void)
     write_file("/proc/self/uid_map", map);
 }
 
+/* A leading ~ stands for the home directory, for paths written in a
+ * profile where no shell expands them. */
+static char *expand_home(const char *arg)
+{
+    const char *home;
+    char *path;
+
+    if (arg[0] != '~' || (arg[1] != '\0' && arg[1] != '/')) {
+        path = strdup(arg);
+        if (path == NULL) die("strdup");
+        return path;
+    }
+    home = getenv("HOME");
+    if (home == NULL) {
+        errno = 0;
+        die("%s: HOME is not set", arg);
+    }
+    if (asprintf(&path, "%s%s", home, arg + 1) < 0) die("asprintf");
+    return path;
+}
+
 static void add_path(const char *arg, int read_only, int hide)
 {
+    char *expanded;
     char *path;
 
     if (bind_count == MAX_BINDS) {
         errno = 0;
         die("too many paths (max %d)", MAX_BINDS);
     }
-    path = realpath(arg, NULL);
+    expanded = expand_home(arg);
+    path = realpath(expanded, NULL);
+    free(expanded);
+    /* A path that does not exist is already invisible. */
+    if (path == NULL && hide && errno == ENOENT) return;
     if (path == NULL) die("%s", arg);
     if (strcmp(path, "/") == 0) {
         errno = 0;
@@ -1172,10 +1198,13 @@ static void add_env(const char *arg)
     extra_env_count++;
 }
 
+/* --net none after --allow/--block rules drops them: a later flag wins,
+ * and without the host's network there is nothing left to filter. */
 static void set_net(const char *arg)
 {
     if (strcmp(arg, "none") == 0) {
         host_network = 0;
+        rule_count = 0;
         return;
     }
     if (strcmp(arg, "host") == 0) {
@@ -1186,9 +1215,139 @@ static void set_net(const char *arg)
     die("--net: expected none or host, got %s", arg);
 }
 
+/* Profiles are files of flags under $XDG_CONFIG_HOME/sand, by default
+ * ~/.config/sand. One flag per line, the same words as on the command
+ * line with or without the dashes; `profile NAME` includes another
+ * file. The profile named `default` is loaded first when it exists. */
+#define MAX_PROFILE_DEPTH 8
+
+static int profile_depth = 0;
+
+static int apply_flag(const char *name, const char *value);
+
+static char *profile_path(const char *name)
+{
+    const char *base;
+    const char *home;
+    char *path;
+
+    if (name[0] == '\0' || strchr(name, '/') != NULL) {
+        errno = 0;
+        die("profile: expected a plain name, got %s", name);
+    }
+    base = getenv("XDG_CONFIG_HOME");
+    if (base != NULL && base[0] != '\0') {
+        if (asprintf(&path, "%s/sand/%s", base, name) < 0) die("asprintf");
+        return path;
+    }
+    home = getenv("HOME");
+    if (home == NULL) {
+        errno = 0;
+        die("profile %s: HOME is not set", name);
+    }
+    if (asprintf(&path, "%s/.config/sand/%s", home, name) < 0) die("asprintf");
+    return path;
+}
+
+static void load_profile(const char *name, int required)
+{
+    char *path;
+    FILE *file;
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t len;
+    int lineno = 0;
+    char *flag;
+    char *value;
+
+    if (profile_depth == MAX_PROFILE_DEPTH) {
+        errno = 0;
+        die("profile %s: nested too deep (a loop?)", name);
+    }
+    path = profile_path(name);
+    file = fopen(path, "r");
+    if (file == NULL) {
+        if (!required && errno == ENOENT) {
+            free(path);
+            return;
+        }
+        die("profile %s", path);
+    }
+    profile_depth++;
+    while ((len = getline(&line, &cap, file)) >= 0) {
+        lineno++;
+        while (len > 0 && strchr(" \t\r\n", line[len - 1]) != NULL) {
+            len--;
+            line[len] = '\0';
+        }
+        flag = line + strspn(line, " \t");
+        if (*flag == '\0' || *flag == '#') continue;
+        if (strncmp(flag, "--", 2) == 0) flag += 2;
+        value = flag + strcspn(flag, " \t");
+        if (*value != '\0') {
+            *value = '\0';
+            value++;
+            value += strspn(value, " \t");
+        }
+        if (*value == '\0') {
+            errno = 0;
+            die("%s:%d: %s needs a value", path, lineno, flag);
+        }
+        if (!apply_flag(flag, value)) {
+            errno = 0;
+            die("%s:%d: unknown flag %s", path, lineno, flag);
+        }
+    }
+    if (ferror(file)) die("profile %s", path);
+    profile_depth--;
+    free(line);
+    free(path);
+    fclose(file);
+}
+
+/* One flag, named without the dashes, from the command line or from a
+ * profile. Returns 0 for a flag it does not know. */
+static int apply_flag(const char *name, const char *value)
+{
+    if (strcmp(name, "ro") == 0) {
+        add_path(value, 1, 0);
+        return 1;
+    }
+    if (strcmp(name, "rw") == 0) {
+        add_path(value, 0, 0);
+        return 1;
+    }
+    if (strcmp(name, "hide") == 0) {
+        add_path(value, 1, 1);
+        return 1;
+    }
+    if (strcmp(name, "env") == 0) {
+        add_env(value);
+        return 1;
+    }
+    if (strcmp(name, "net") == 0) {
+        set_net(value);
+        return 1;
+    }
+    if (strcmp(name, "allow") == 0) {
+        add_rule(value, 1);
+        return 1;
+    }
+    if (strcmp(name, "block") == 0) {
+        add_rule(value, 0);
+        return 1;
+    }
+    if (strcmp(name, "profile") == 0) {
+        load_profile(value, 1);
+        return 1;
+    }
+    return 0;
+}
+
 static void usage(void)
 {
-    fprintf(stderr, "usage: sand [--ro PATH | --rw PATH | --hide PATH | --env NAME[=VALUE] | --net MODE]... [-- COMMAND [ARG]...]\n");
+    fprintf(stderr, "usage: sand [-p NAME | --ro PATH | --rw PATH | --hide PATH | --env NAME[=VALUE] | --net MODE]... [COMMAND [ARG]...]\n");
+    fprintf(stderr, "  -p, --profile NAME load the flags in ~/.config/sand/NAME\n");
     fprintf(stderr, "  --ro PATH          also make PATH visible, read-only\n");
     fprintf(stderr, "  --rw PATH          also make PATH visible, writable\n");
     fprintf(stderr, "  --hide PATH        make a visible PATH appear empty\n");
@@ -1200,8 +1359,9 @@ static void usage(void)
     fprintf(stderr, "    RULE = [src:][ADDR[/PREFIX]][:PORT[-PORT]] | all\n");
     fprintf(stderr, "    e.g. 10.0.0.0/8:443  1.1.1.1  :53  8000-9000  [::1]:80  src:8080\n");
     fprintf(stderr, "    src: rules apply to bind (listening and explicit source ports)\n");
-    fprintf(stderr, "  -- COMMAND         run COMMAND instead of $SHELL\n");
+    fprintf(stderr, "  COMMAND [ARG]...   run COMMAND instead of $SHELL; -- before it if it starts with -\n");
     fprintf(stderr, "Flags may repeat; a later flag wins. Use --rw . for a writable cwd.\n");
+    fprintf(stderr, "The profile ~/.config/sand/default, if present, is loaded first.\n");
     exit(2);
 }
 
@@ -1212,6 +1372,7 @@ int main(int argc, char **argv)
     pid_t pid;
     int status;
     int i;
+    const char *name;
 
     if (getcwd(cwd, sizeof(cwd)) == NULL) die("getcwd");
     if (strcmp(cwd, "/") == 0) {
@@ -1221,48 +1382,28 @@ int main(int argc, char **argv)
     add_path(cwd, 1, 0);
     add_resolv_conf();
 
+    load_profile("default", 0);
+
     for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--ro") == 0 && i + 1 < argc) {
-            i++;
-            add_path(argv[i], 1, 0);
-            continue;
-        }
-        if (strcmp(argv[i], "--rw") == 0 && i + 1 < argc) {
-            i++;
-            add_path(argv[i], 0, 0);
-            continue;
-        }
-        if (strcmp(argv[i], "--hide") == 0 && i + 1 < argc) {
-            i++;
-            add_path(argv[i], 1, 1);
-            continue;
-        }
-        if (strcmp(argv[i], "--env") == 0 && i + 1 < argc) {
-            i++;
-            add_env(argv[i]);
-            continue;
-        }
-        if (strcmp(argv[i], "--net") == 0 && i + 1 < argc) {
-            i++;
-            set_net(argv[i]);
-            continue;
-        }
-        if (strcmp(argv[i], "--allow") == 0 && i + 1 < argc) {
-            i++;
-            add_rule(argv[i], 1);
-            continue;
-        }
-        if (strcmp(argv[i], "--block") == 0 && i + 1 < argc) {
-            i++;
-            add_rule(argv[i], 0);
-            continue;
-        }
         if (strcmp(argv[i], "--") == 0) {
             if (i + 1 == argc) usage();
             command = argv + i + 1;
             break;
         }
-        usage();
+        if (argv[i][0] != '-') {
+            command = argv + i;
+            break;
+        }
+        if (strcmp(argv[i], "-p") == 0) {
+            name = "profile";
+        } else if (strncmp(argv[i], "--", 2) == 0) {
+            name = argv[i] + 2;
+        } else {
+            usage();
+        }
+        if (i + 1 == argc) usage();
+        if (!apply_flag(name, argv[i + 1])) usage();
+        i++;
     }
 
     if (rule_count > 0 && !host_network) {

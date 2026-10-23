@@ -1,0 +1,8 @@
+# the home directory is visible, read-only, without keys and credentials
+ro ~
+hide ~/.ssh
+hide ~/.gnupg
+hide ~/.aws
+hide ~/.config/gh
+hide ~/.netrc
+hide ~/.git-credentials

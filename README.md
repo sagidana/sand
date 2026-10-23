@@ -4,9 +4,10 @@ Run a command, or an interactive shell, in the current directory with
 restrictions. One C file, Linux only, no root, no dependencies.
 
     sand                                   shell in the cwd, read-only, no network
-    sand -- python script.py               run a command instead of a shell
-    sand --rw out -- make                  one writable directory
-    sand --net host --allow :443 -- curl https://example.com
+    sand python script.py                  run a command instead of a shell
+    sand --rw out make                     one writable directory
+    sand --net host --allow :443 curl https://example.com
+    sand -p dev make                       flags written once, in ~/.config/sand/dev
 
 The sandbox is built from Linux namespaces: the command gets its own
 user, mount, pid, ipc and uts namespaces, and by default its own empty
@@ -18,6 +19,12 @@ root. Sandboxes nest.
     make
     make install                 # /usr/local/bin/sand
     make install PREFIX=~/.local # anywhere else
+
+`make install` also puts a bash completion file under
+`PREFIX/share/bash-completion/completions`, which the bash-completion
+package picks up from `/usr/local` and from `~/.local`. It completes
+flags, profile names and paths, and after them the command's own
+completion takes over, as it does for `sudo`.
 
 Requires a Linux kernel of 5.6 or newer with unprivileged user
 namespaces enabled (the default on most distributions, and on WSL2),
@@ -42,6 +49,7 @@ is set, so setuid programs such as `sudo` do nothing special.
 
 ## Flags
 
+    -p, --profile NAME   load the flags written in ~/.config/sand/NAME
     --ro PATH            also make PATH visible, read-only
     --rw PATH            also make PATH visible, writable
     --hide PATH          make a visible PATH appear empty
@@ -50,11 +58,61 @@ is set, so setuid programs such as `sudo` do nothing special.
     --net none|host      loopback only (default), or the host's network
     --allow RULE         with --net host: allow matching traffic
     --block RULE         with --net host: block matching traffic
-    -- COMMAND [ARG]...  run COMMAND instead of $SHELL
+    COMMAND [ARG]...     run COMMAND instead of $SHELL
+
+The first word that is not a flag starts the command. A command whose
+name begins with `-` needs `--` in front of it.
 
 Path flags take files or directories and may repeat. They apply in
 order and a later flag wins, so `--rw .` makes the cwd writable and
 `--ro ~ --hide ~/.ssh` shows the home directory without the keys.
+`--net none` after network rules drops them.
+
+## Profiles
+
+A profile is a file of flags under `~/.config/sand` (or
+`$XDG_CONFIG_HOME/sand`), one per line, the same words as on the
+command line with or without the dashes. `#` starts a comment and `~`
+at the start of a path means the home directory. `profile NAME` loads
+another profile in place, which is how a hierarchy is built:
+
+    # ~/.config/sand/net        dns and https, nothing else
+    net host
+    allow :53
+    allow :443
+
+    # ~/.config/sand/lan        the same, plus the local network
+    profile net
+    allow 10.0.0.0/8
+    allow 192.168.0.0/16
+
+    # ~/.config/sand/dev        a working setup for this machine
+    profile lan
+    rw .
+    ro ~/.cache/pip
+    env SSH_AUTH_SOCK
+
+    sand -p dev make
+    sand -p lan -p build ./run.sh
+    sand -p dev --net none make test      flags after the profile override it
+
+Profiles hold only flags, never a command. Everything is applied in
+one sequence, later wins: the profile `default` first if it exists,
+then the command line left to right, with each `-p` expanding in
+place. Relative paths in a profile are relative to the directory
+`sand` is started in, like on the command line. A `hide` of a path
+that does not exist is a no-op, so one profile can serve machines
+with different dotfiles.
+
+The `profiles/` directory holds a few to start from; `make
+install-profiles` copies them to `~/.config/sand` without overwriting
+anything already there:
+
+    net      host network, but only name lookup and https
+    lan      like net, plus the private address ranges
+    online   the host's network, unfiltered
+    rw       the current directory is writable
+    home     the home directory read-only, minus keys and credentials
 
 The command's exit status is returned. A command that cannot be found
 gives 127, one that cannot be executed gives 126, like a shell.
@@ -81,9 +139,9 @@ A blocked call fails with "Network is unreachable" (EACCES for bind)
 and a line on stderr names the address, which helps when wrapping a
 program whose network needs are not documented.
 
-    sand --net host --allow :53 --allow :443 -- pip install requests
-    sand --net host --block :25 -- ./app
-    sand --net host --allow 10.0.0.0/8 --block 10.1.0.0/16 -- ./app
+    sand --net host --allow :53 --allow :443 pip install requests
+    sand --net host --block :25 ./app
+    sand --net host --allow 10.0.0.0/8 --block 10.1.0.0/16 ./app
 
 How it works: the command runs under a seccomp filter that hands
 `connect`, `bind`, `sendmsg`, `sendmmsg` and address-carrying `sendto`
@@ -102,7 +160,15 @@ the outer rules.
 
 `sand` inside `sand` works, as long as the binary is visible
 inside (it is if it is installed under `/usr`, or pass `--ro` for it).
-Each level can only restrict further.
+Each level can only restrict further. The inner `sand` only sees
+profiles if `~/.config/sand` is passed in with `--ro`.
+
+## Tests
+
+    make test                    # or ./test.sh [NAME...]
+
+`test.sh` runs the built binary on small cases and prints one line per
+case. The network cases need `python3` for a local listener.
 
 ## Not covered
 

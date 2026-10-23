@@ -7,6 +7,7 @@ restrictions. One C file, Linux only, no root, no dependencies.
     sand python script.py                  run a command instead of a shell
     sand --rw out make                     one writable directory
     sand --net host curl https://example.com
+    sand --net work make                   a network built once by sand-net
     sand -p dev make                       flags written once, in ~/.config/sand/dev
 
 The sandbox is built from Linux namespaces: the command gets its own
@@ -17,7 +18,7 @@ root. Sandboxes nest.
 ## Build and install
 
     make
-    make install                 # /usr/local/bin/sand
+    make install                 # /usr/local/bin/sand and sand-net
     make install PREFIX=~/.local # anywhere else
 
 `make install` also puts a bash completion file under
@@ -65,7 +66,8 @@ sandbox and everything in it ends with it.
     --hide PATH          make a visible PATH appear empty
     --env NAME           pass the host's NAME through to the command
     --env NAME=VALUE     set NAME for the command
-    --net none|host      loopback only (default), or the host's network
+    --net none|host|NAME loopback only (default), the host's network,
+                         or a network built by sand-net
     COMMAND [ARG]...     run COMMAND instead of $SHELL
 
 The first word that is not a flag starts the command. A command whose
@@ -116,6 +118,51 @@ you want to `~/.config/sand`:
 The command's exit status is returned. A command that cannot be found
 gives 127, one that cannot be executed gives 126, like a shell.
 
+## Networks
+
+Between no network and the host's whole network there are named
+networks: a network namespace of its own with a way out through the
+host, built once with root by `sand-net`, and joined by `sand` without
+it.
+
+    sudo sand-net create work            # for the user running sudo
+    sand --net work curl https://example.com
+    sand-net list
+    sudo sand-net delete work
+
+In a profile that is `net work`. Inside, the command sees `lo` and an
+`eth0` with a private address; the host forwards its traffic out
+through NAT, as a router does. `create` takes `--dns ADDR` to name the
+resolver the network should use; by default it copies the host's,
+or the ones behind the host's local stub resolver. Nothing can reach
+the network from outside.
+
+What `create` builds: a user namespace owned by the user with the
+network namespace inside it, both kept alive by bind mounts under
+`/var/lib/sand/net/NAME`; a veth pair with one end inside and one on
+the host, named `sand-NAME`, on a `/30` from `10.44.0.0/16`;
+forwarding; and one nft table `sand` holding the masquerade for every
+network. The ownership is what lets `sand` join without root: the
+owner of a user namespace has every capability in it, including the
+one needed to enter the network namespace. The command then runs one
+namespace deeper, with no capability over the network. On a host with
+Docker, which drops forwarded traffic, an accept for the veth goes
+into its `DOCKER-USER` chain.
+
+The namespaces and the host side are kernel state and do not survive a
+reboot; the configuration under `/var/lib/sand/net` does. `sudo
+sand-net up` rebuilds whatever is missing, for one network or all, and
+is safe to run at any time. A line in a boot script or a one-line
+systemd unit makes it automatic. `sand --net NAME` refuses to start
+when the network is down, so a stale namespace never silently means no
+network. If some other tool flushes the firewall or turns forwarding
+off, the networks lose their way out until the next `up`, and never
+gain more than they had.
+
+`sand-net` runs `ip` and `nft`, and `iptables` where Docker is
+present. Filtering by address and port is the next step and will be
+part of the network, not of `sand`.
+
 ## Nesting
 
 `sand` inside `sand` works, as long as the binary is visible
@@ -142,10 +189,8 @@ grow. There is no wall-clock timeout either; use `timeout(1)` in front.
 Real limits need cgroups, which an unprivileged process only gets when
 the system delegates a cgroup to it.
 
-Network filtering. The network is either absent or the host's as is;
-there is no rule by address, port or name. The plan is a separate
-step that creates named network namespaces with their own rules once,
-with root, which a profile then joins without it.
+Network filtering. A network built by `sand-net` reaches everything
+the host does; rules by address, port or name on it come next.
 
 Root inside. The command runs as your own user, not as root in a user
 namespace. `apt install`, `chown` to another user, `mknod`, mounting

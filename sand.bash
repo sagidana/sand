@@ -41,7 +41,7 @@ _sand()
             return
             ;;
         --net)
-            COMPREPLY=($(compgen -W 'none host' -- "$cur"))
+            COMPREPLY=($(compgen -W "none host $(ls /var/lib/sand/net 2>/dev/null)" -- "$cur"))
             return
             ;;
     esac

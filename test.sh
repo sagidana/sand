@@ -12,9 +12,10 @@ set -u
 cd "$(dirname "$0")" || exit 1
 SAND=${SAND:-$PWD/sand}
 SAND=$(realpath "$SAND") || exit 1
+SANDNET=${SANDNET:-$PWD/sand-net}
 
 T=$(mktemp -d) || exit 1
-trap 'kill $LISTENER 2>/dev/null; rm -rf "$T"' EXIT
+trap 'kill $LISTENER $HOLDER 2>/dev/null; rm -rf "$T"' EXIT
 WORK=$T/work
 mkdir -p "$WORK/sub" "$T/other" "$T/cfg/sand"
 echo hello > "$WORK/file"
@@ -191,6 +192,80 @@ if [ -n "${PORT:-}" ]; then
 else
     skipped "network host case" "python3 not found"
 fi
+
+# --- named networks ---------------------------------------------------
+# sand-net needs root and ip/nft to build one; what can be tested here
+# is the join: a holder process makes a user namespace it owns with a
+# network namespace inside, listening on a port there, and a directory
+# points at its namespace files the way /var/lib/sand/net/NAME would.
+
+HOLDER=
+NPORT=
+if command -v python3 >/dev/null; then
+    python3 - "$T/holder" <<'PY' &
+import ctypes, fcntl, os, socket, struct, sys
+libc = ctypes.CDLL(None, use_errno=True)
+uid, gid = os.getuid(), os.getgid()
+if libc.unshare(0x10000000) != 0:
+    sys.exit("unshare user: " + os.strerror(ctypes.get_errno()))
+open("/proc/self/setgroups", "w").write("deny")
+open("/proc/self/gid_map", "w").write("%d %d 1" % (gid, gid))
+open("/proc/self/uid_map", "w").write("%d %d 1" % (uid, uid))
+if libc.unshare(0x40000000) != 0:
+    sys.exit("unshare net: " + os.strerror(ctypes.get_errno()))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+flags = struct.unpack("16sH14s", fcntl.ioctl(s, 0x8913, struct.pack("16sH14s", b"lo", 0, b"")))[1]
+fcntl.ioctl(s, 0x8914, struct.pack("16sH14s", b"lo", flags | 1, b""))
+l = socket.socket()
+l.bind(("127.0.0.1", 0))
+l.listen()
+open(sys.argv[1], "w").write("%d %d" % (os.getpid(), l.getsockname()[1]))
+while True:
+    c, _ = l.accept()
+    c.send(b"inside\n")
+    c.close()
+PY
+    HOLDER=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -s "$T/holder" ] && break
+        sleep 0.2
+    done
+    read -r HPID NPORT < "$T/holder" 2>/dev/null
+fi
+if [ -n "${NPORT:-}" ]; then
+    mkdir -p "$T/netA" "$T/stale"
+    ln -s "/proc/$HPID/ns/user" "$T/netA/user"
+    ln -s "/proc/$HPID/ns/net" "$T/netA/net"
+    echo "nameserver 10.44.1.1" > "$T/netA/resolv.conf"
+    touch "$T/stale/user" "$T/stale/net"
+    inside="exec 3<>/dev/tcp/127.0.0.1/$NPORT && head -1 <&3"
+    expect "--net DIR joins the network" 0 "inside" \
+        --net "$T/netA" bash -c "$inside"
+    expect "a joined network has no capabilities" 0 "CapEff:*0000000000000000" \
+        --net "$T/netA" grep CapEff /proc/self/status
+    expect "a joined network brings its resolv.conf" 0 "nameserver 10.44.1.1" \
+        --net "$T/netA" cat /etc/resolv.conf
+    expect "net DIR in a profile" 0 "inside" \
+        --ro "$T/netA" --net "$T/netA" bash -c "$inside"
+    profile joined "net $T/netA"
+    expect "net in a profile joins" 0 "inside" \
+        -p joined bash -c "$inside"
+    expect "--net none after a network is empty again" 1 "*refused*" \
+        -p joined --net none bash -c "$inside"
+    expect "a stale network is refused" 1 "*not a namespace*sand-net up*" \
+        --net "$T/stale" true
+    expect "--net NAME looks under /var/lib/sand/net" 1 "*/var/lib/sand/net/nosuch/user*" \
+        --net nosuch true
+else
+    skipped "named network cases" "python3 not found"
+fi
+
+expect "sand-net list without state" 0 "" \
+    --ro "$SANDNET" "$SANDNET" list
+expect "sand-net create needs root" 1 "*needs root*" \
+    --ro "$SANDNET" "$SANDNET" create x
+expect "sand-net without a command gives usage" 2 "usage:*" \
+    --ro "$SANDNET" "$SANDNET"
 
 # --- nesting ----------------------------------------------------------
 

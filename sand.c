@@ -11,7 +11,10 @@
  *   - a fresh /tmp, a fresh /proc, and a minimal /dev with its own
  *     /dev/shm and /dev/pts
  * By default it has no network: the new net namespace holds nothing but
- * loopback. --net host keeps the host's network instead.
+ * loopback. --net host keeps the host's network instead, and --net NAME
+ * joins a network that sand-net built: its network namespace sits in a
+ * user namespace owned by the user, and the owner of a user namespace
+ * has every capability in it, so both can be entered without privilege.
  *
  * Process layout:
  *   sand (host)  ->  init (pid 1 in the sandbox)  ->  command
@@ -56,6 +59,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 
 /* The new root is staged on a tmpfs mounted over this directory.
@@ -111,6 +115,18 @@ static char **command = NULL;
 
 /* --net host: stay in the host's network namespace. */
 static int host_network = 0;
+
+/* --net NAME: the directory holding the user and net namespace files of
+ * a network built by sand-net, plus its resolv.conf. */
+#define NET_STATE "/var/lib/sand/net"
+
+static char *net_dir = NULL;
+
+/* Whether the sandbox gets a fresh, empty network namespace. */
+static int own_network(void)
+{
+    return !host_network && net_dir == NULL;
+}
 
 /* Extra environment entries from --env, as "NAME=VALUE" strings. */
 #define MAX_ENV 64
@@ -644,7 +660,7 @@ static int run_init(const char *cwd)
         close(stop_pipe[0]);
     }
 
-    if (!host_network) loopback_up();
+    if (own_network()) loopback_up();
     build_root(cwd);
     if (sethostname("sand", 4) < 0) die("sethostname");
 
@@ -657,6 +673,37 @@ static int run_init(const char *cwd)
     return exit_status(supervise(child));
 }
 
+/* Open one namespace file of the network, checking it still is one:
+ * after a reboot the mounts are gone and plain empty files remain. */
+#define NSFS_MAGIC 0x6e736673
+
+static int open_namespace(const char *kind)
+{
+    char path[PATH_MAX];
+    struct statfs st;
+    int fd;
+
+    snprintf(path, sizeof(path), "%s/%s", net_dir, kind);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) die("open %s", path);
+    if (fstatfs(fd, &st) < 0) die("statfs %s", path);
+    if (st.f_type != NSFS_MAGIC) fail("%s: not a namespace; the network is down, run: sudo sand-net up", path);
+    return fd;
+}
+
+/* Enter the network's user namespace, which we own, and then its
+ * network namespace, which that ownership lets us enter. */
+static void join_network(void)
+{
+    int user_fd = open_namespace("user");
+    int net_fd = open_namespace("net");
+
+    if (setns(user_fd, CLONE_NEWUSER) < 0) die("join the user namespace of %s", net_dir);
+    if (setns(net_fd, CLONE_NEWNET) < 0) die("join the network namespace of %s", net_dir);
+    close(user_fd);
+    close(net_fd);
+}
+
 static void enter_namespaces(void)
 {
     uid_t uid = getuid();
@@ -664,7 +711,8 @@ static void enter_namespaces(void)
     char map[64];
     int flags = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS;
 
-    if (!host_network) flags |= CLONE_NEWNET;
+    if (net_dir != NULL) join_network();
+    if (own_network()) flags |= CLONE_NEWNET;
     if (unshare(flags) < 0) die("unshare (are unprivileged user namespaces enabled?)");
 
     /* Map our own uid/gid to the same numbers inside. */
@@ -713,30 +761,34 @@ static void add_path(const char *arg, int read_only, int hide)
     bind_count++;
 }
 
-/* /etc/resolv.conf is often a symlink to a file outside the system dirs
- * (/run/systemd/resolve/stub-resolv.conf, /mnt/wsl/resolv.conf). Inside
- * the sandbox that link would dangle and name lookup would fail. Bind the
- * real file at the path the link points to, so the link resolves again. */
-static void add_resolv_conf(void)
+/* Make file serve as /etc/resolv.conf inside. That is often a symlink
+ * to a file outside the system dirs (/run/systemd/resolve/stub-resolv.conf,
+ * /mnt/wsl/resolv.conf), which would dangle inside; so the file is bound
+ * at the path the link points to, and over /etc/resolv.conf itself when
+ * there is no link. The host's own file is the default, a network's
+ * replaces it. */
+static void add_resolv_conf(const char *file)
 {
     char link[PATH_MAX];
     char *path;
     char *dst;
     ssize_t n;
 
-    n = readlink("/etc/resolv.conf", link, sizeof(link) - 1);
-    if (n < 0) return;
-    link[n] = '\0';
-
-    path = realpath("/etc/resolv.conf", NULL);
+    path = realpath(file, NULL);
     if (path == NULL) return;
 
-    if (link[0] == '/') {
-        dst = strdup(link);
+    n = readlink("/etc/resolv.conf", link, sizeof(link) - 1);
+    if (n < 0) {
+        /* The host's file, not a link: it is already in place. */
+        if (strcmp(path, "/etc/resolv.conf") == 0) return;
+        dst = strdup("/etc/resolv.conf");
     } else {
-        if (asprintf(&dst, "/etc/%s", link) < 0) die("asprintf");
+        link[n] = '\0';
+        if (link[0] == '/') dst = strdup(link);
+        else if (asprintf(&dst, "/etc/%s", link) < 0) die("asprintf");
     }
     if (dst == NULL) die("strdup");
+    if (bind_count == MAX_BINDS) fail("too many paths (max %d)", MAX_BINDS);
 
     binds[bind_count].path = path;
     binds[bind_count].dst = dst;
@@ -763,17 +815,23 @@ static void add_env(const char *arg)
     extra_env_count++;
 }
 
+/* --net none: an empty network. host: the host's. Anything else names
+ * a network built by sand-net, under /var/lib/sand/net, or with a slash
+ * a directory holding such a network's files. */
 static void set_net(const char *arg)
 {
-    if (strcmp(arg, "none") == 0) {
-        host_network = 0;
-        return;
-    }
+    host_network = 0;
+    net_dir = NULL;
+    if (strcmp(arg, "none") == 0) return;
     if (strcmp(arg, "host") == 0) {
         host_network = 1;
         return;
     }
-    fail("--net: expected none or host, got %s", arg);
+    if (strchr(arg, '/') != NULL) {
+        net_dir = expand_home(arg);
+        return;
+    }
+    if (asprintf(&net_dir, NET_STATE "/%s", arg) < 0) die("asprintf");
 }
 
 /* Profiles are files of flags under $XDG_CONFIG_HOME/sand, by default
@@ -884,14 +942,14 @@ static int apply_flag(const char *name, const char *value)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: sand [-p NAME | --ro PATH | --rw PATH | --hide PATH | --env NAME[=VALUE] | --net MODE]... [COMMAND [ARG]...]\n");
+    fprintf(stderr, "usage: sand [-p NAME | --ro PATH | --rw PATH | --hide PATH | --env NAME[=VALUE] | --net none|host|NAME]... [COMMAND [ARG]...]\n");
     fprintf(stderr, "  -p, --profile NAME load the flags in ~/.config/sand/NAME\n");
     fprintf(stderr, "  --ro PATH          also make PATH visible, read-only\n");
     fprintf(stderr, "  --rw PATH          also make PATH visible, writable\n");
     fprintf(stderr, "  --hide PATH        make a visible PATH appear empty\n");
     fprintf(stderr, "  --env NAME         pass the host's NAME through to the command\n");
     fprintf(stderr, "  --env NAME=VALUE   set NAME for the command\n");
-    fprintf(stderr, "  --net none|host    no network (default), or the host's network\n");
+    fprintf(stderr, "  --net none|host|NAME  no network (default), the host's, or one built by sand-net\n");
     fprintf(stderr, "  COMMAND [ARG]...   run COMMAND instead of $SHELL; -- before it if it starts with -\n");
     fprintf(stderr, "Flags may repeat; a later flag wins. Use --rw . for a writable cwd.\n");
     fprintf(stderr, "The profile ~/.config/sand/default, if present, is loaded first.\n");
@@ -905,11 +963,12 @@ int main(int argc, char **argv)
     int status;
     int i;
     const char *name;
+    char *file;
 
     if (getcwd(cwd, sizeof(cwd)) == NULL) die("getcwd");
     if (strcmp(cwd, "/") == 0) fail("refusing to sandbox the root directory");
     add_path(cwd, 1, 0);
-    add_resolv_conf();
+    add_resolv_conf("/etc/resolv.conf");
 
     load_profile("default", 0);
 
@@ -933,6 +992,11 @@ int main(int argc, char **argv)
         if (i + 1 == argc) usage();
         if (!apply_flag(name, argv[i + 1])) usage();
         i++;
+    }
+
+    if (net_dir != NULL) {
+        if (asprintf(&file, "%s/resolv.conf", net_dir) < 0) die("asprintf");
+        add_resolv_conf(file);
     }
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) die("no_new_privs");

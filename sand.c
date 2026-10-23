@@ -20,7 +20,9 @@
  *
  * Process layout:
  *   sand (host)  ->  init (pid 1 in the sandbox)  ->  command
- * init reaps orphans and forwards SIGTERM/SIGHUP to the command.
+ * init reaps orphans and forwards SIGTERM/SIGHUP to the command, and
+ * SIGINT/SIGQUIT when there is no terminal to deliver them. Init dies
+ * with sand (PR_SET_PDEATHSIG), which ends the whole pid namespace.
  *
  * Terminal: the foreground process group the shell gave sand has no
  * visible id inside the pid namespace, so job control in the command
@@ -32,6 +34,10 @@
  * itself: the host shell sees its job stop. On fg sand hands the
  * terminal back to the command's group and continues it, and on bg
  * continues it without the terminal. The same model as sudo.
+ *
+ * Started in the background (sand cmd &), init still forms its group
+ * but leaves the terminal alone; a command that then reads from it
+ * stops with SIGTTIN like any background job, and fg works as above.
  */
 
 #define _GNU_SOURCE
@@ -149,10 +155,18 @@ static int extra_env_count = 0;
 /* The process that signals get forwarded to. */
 static pid_t forward_to = 0;
 
+/* sand's own pid, for init to check its parent is still that. */
+static pid_t sand_pid = 0;
+
 /* The controlling terminal, or -1, and the group that held it when
  * sand started, to be restored on exit. */
 static int tty_fd = -1;
 static pid_t tty_pgrp = 0;
+
+/* Whether the terminal is on our side: held by sand's group at start,
+ * or handed to the command's group after fg. Only then is it given
+ * back on exit; after bg someone else may be using it. */
+static int foreground = 0;
 
 /* init tells sand that the command stopped: one byte, the signal. */
 static int stop_pipe[2] = {-1, -1};
@@ -395,9 +409,16 @@ static void install_signal_handlers(void)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
 
-    /* The terminal delivers these to the shell directly. */
-    signal(SIGINT, SIG_IGN);
-    signal(SIGQUIT, SIG_IGN);
+    /* With a terminal these reach the command's group directly, and
+     * forwarding would deliver them twice. Without one they only
+     * arrive by kill, from a script or a supervisor: pass them on. */
+    if (tty_fd >= 0) {
+        signal(SIGINT, SIG_IGN);
+        signal(SIGQUIT, SIG_IGN);
+        return;
+    }
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGQUIT, &sa, NULL);
 }
 
 static void find_terminal(void)
@@ -408,6 +429,7 @@ static void find_terminal(void)
         tty_pgrp = tcgetpgrp(fd);
         if (tty_pgrp < 0) continue;
         tty_fd = fd;
+        foreground = tty_pgrp == getpgrp();
         return;
     }
 }
@@ -443,15 +465,17 @@ static void report_stop(int status)
  * With fg the shell has given us the terminal, pass it on to the
  * command's group and continue it; with bg continue it without the
  * terminal, so it stops again if it touches the terminal. The group
- * is read here on the host, where it has a visible id. */
+ * is read from the terminal here on the host, where it has a visible
+ * id, when our side held it; in the background it is init's. */
 static void relay_stop(int sig, pid_t init)
 {
-    pid_t group;
+    pid_t group = 0;
 
-    group = tcgetpgrp(tty_fd);
+    if (foreground) group = tcgetpgrp(tty_fd);
     if (group <= 0) group = init;
     kill(0, sig);
-    if (tcgetpgrp(tty_fd) == getpgrp()) give_terminal(group);
+    foreground = tcgetpgrp(tty_fd) == getpgrp();
+    if (foreground) give_terminal(group);
     killpg(group, SIGCONT);
 }
 
@@ -959,12 +983,30 @@ static const char *kept_env[] = {
     NULL,
 };
 
+/* Add a NAME=VALUE entry to env, replacing an entry of the same name:
+ * with duplicates a shell would take the last and libc the first. */
+static void set_env(char **env, int *count, char *entry)
+{
+    size_t name_len = strcspn(entry, "=");
+    int i;
+
+    for (i = 0; i < *count; i++) {
+        if (strncmp(env[i], entry, name_len) != 0) continue;
+        if (env[i][name_len] != '=') continue;
+        env[i] = entry;
+        return;
+    }
+    env[*count] = entry;
+    *count = *count + 1;
+}
+
 static void run_command(void)
 {
     const char *shell = getenv("SHELL");
     const char **name;
     const char *value;
     char *env[16 + MAX_ENV];
+    char *entry;
     int n = 0;
     int i;
     int listener;
@@ -974,15 +1016,13 @@ static void run_command(void)
     for (name = kept_env; *name != NULL; name++) {
         value = getenv(*name);
         if (value == NULL) continue;
-        if (asprintf(&env[n], "%s=%s", *name, value) < 0) die("asprintf");
-        n++;
+        if (asprintf(&entry, "%s=%s", *name, value) < 0) die("asprintf");
+        set_env(env, &n, entry);
     }
     for (i = 0; i < extra_env_count; i++) {
-        env[n] = extra_env[i];
-        n++;
+        set_env(env, &n, extra_env[i]);
     }
-    env[n] = "SAND=1";
-    n++;
+    set_env(env, &n, "SAND=1");
     env[n] = NULL;
 
     /* Blocked in init for its signalfd; the mask survives exec. */
@@ -1042,11 +1082,18 @@ static int run_init(const char *cwd)
     int listener = -1;
     sigset_t chld;
 
-    /* Own process group, holding the terminal: see the terminal note at
-     * the top. Done before the command exists so it inherits the group. */
+    /* If sand goes away, even by SIGKILL, so does the sandbox: killing
+     * pid 1 of the namespace kills everything in it. The check covers
+     * sand dying before the prctl took effect. */
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) die("pdeathsig");
+    if (getppid() != sand_pid) raise(SIGKILL);
+
+    /* Own process group, holding the terminal if sand did: see the
+     * terminal note at the top. Done before the command exists so it
+     * inherits the group. */
     if (tty_fd >= 0) {
         if (setpgid(0, 0) < 0) die("setpgid");
-        if (give_terminal(getpid()) < 0) die("tcsetpgrp");
+        if (foreground && give_terminal(getpid()) < 0) die("tcsetpgrp");
         close(stop_pipe[0]);
     }
     sigemptyset(&chld);
@@ -1559,6 +1606,7 @@ int main(int argc, char **argv)
     enter_namespaces();
 
     /* unshare(CLONE_NEWPID) only applies to children: fork to get pid 1. */
+    sand_pid = getpid();
     init = fork();
     if (init < 0) die("fork");
     if (init == 0) exit(run_init(cwd));
@@ -1569,7 +1617,7 @@ int main(int argc, char **argv)
     if (tty_fd >= 0) {
         close(stop_pipe[1]);
         status = wait_for_init(init);
-        give_terminal(tty_pgrp);
+        if (foreground) give_terminal(tty_pgrp);
         return exit_status(status);
     }
     for (;;) {

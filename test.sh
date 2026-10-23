@@ -105,6 +105,10 @@ expect "--env NAME passes a value" 0 "fromhost" \
     --env SECRET sh -c 'echo $SECRET'
 expect "--env NAME=VALUE sets one" 0 "set" \
     --env SECRET=set sh -c 'echo $SECRET'
+expect "--env replaces a kept name, once" 0 "HOME=/elsewhere" \
+    --env HOME=/elsewhere sh -c 'env | grep ^HOME='
+expect "later --env replaces an earlier one" 0 "SECRET=two" \
+    --env SECRET=one --env SECRET=two sh -c 'env | grep ^SECRET='
 unset SECRET
 expect "own pid namespace" 0 "small" \
     sh -c 'test $$ -lt 10 && echo small'
@@ -122,6 +126,34 @@ expect "-- allows a command starting with -" 127 "*-weird*" \
     -- -weird
 expect "flag after command belongs to it" 0 "--rw" \
     echo --rw
+
+# Runs sand in the background without a terminal, sends it SIG after a
+# moment, waits for it; sets $status and $survivors (processes left
+# running the marker command).
+signal_case() {
+    local sig=$1 marker=$2
+    shift 2
+    (cd "$WORK" && exec "$SAND" "$@" sh -c "exec sleep $marker") </dev/null >/dev/null 2>&1 &
+    local pid=$!
+    sleep 0.5
+    kill -"$sig" "$pid"
+    wait "$pid" 2>/dev/null
+    status=$?
+    sleep 0.5
+    survivors=$(pgrep -f "sleep $marker" | wc -l)
+    pkill -f "sleep $marker" 2>/dev/null
+}
+
+if selected "SIGINT without a terminal reaches the command"; then
+    signal_case INT 31338
+    if [ "$status" = 130 ] && [ "$survivors" = 0 ]; then ok "SIGINT without a terminal reaches the command"
+    else bad "SIGINT without a terminal reaches the command" "exit $status, $survivors process(es) survived"; fi
+fi
+if selected "SIGKILL on sand ends the sandbox"; then
+    signal_case KILL 31337
+    if [ "$survivors" = 0 ]; then ok "SIGKILL on sand ends the sandbox"
+    else bad "SIGKILL on sand ends the sandbox" "$survivors process(es) survived"; fi
+fi
 
 # --- network ----------------------------------------------------------
 
@@ -288,6 +320,12 @@ if command -v python3 >/dev/null; then
     tty_case "tty: bg continues the job without the terminal" \
         ">$SAND -- sleep 100" "^Z" "<Stopped" ">bg" "<sleep 100" ">jobs" "<Running" \
         ">kill %1; wait %1; echo rc=\$?" "<rc=143"
+    tty_case "tty: background start leaves the shell its terminal" \
+        ">$SAND -- sleep 100 &" ">echo outer-alive" "<outer-alive" \
+        ">kill %1; wait %1; echo rc=\$?" "<rc=143"
+    tty_case "tty: background job reading the terminal stops, fg feeds it" \
+        ">$SAND -- sh -c 'read x; echo got:\$x' &" ">echo outer-alive" "<outer-alive" \
+        ">wait" "<Stopped" ">fg" ">hello" "<got:hello"
     tty_case "tty: inner shell job control" \
         ">$SAND -- bash --norc -i" ">sleep 100 &" ">jobs" "<Running" \
         ">kill %1; wait; echo jo''bs-ok" "<jobs-ok" ">exit" ">echo do''ne:\$?" "<done:0"
@@ -334,8 +372,8 @@ expect "no default profile is fine" 0 "none" \
 profile default "env FOO=default"
 expect "default profile is loaded first" 0 "default" \
     sh -c 'echo $FOO'
-expect "command line overrides default" 0 "cli" \
-    --env FOO=cli sh -c 'echo $FOO'
+expect "command line overrides default" 0 "FOO=cli" \
+    --env FOO=cli sh -c 'env | grep ^FOO='
 expect "--hide of a missing path is a no-op" 0 "ok" \
     --hide "$T/nowhere" echo ok
 expect "--ro of a missing path fails" 1 "*nowhere*No such file*" \

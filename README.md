@@ -50,7 +50,11 @@ is set, so setuid programs such as `sudo` do nothing special.
 The terminal belongs to the command while it runs, as with `sudo`:
 Ctrl-C and Ctrl-Z go to it, not to `sand`, a shell inside has working
 job control, and Ctrl-Z followed by `fg` or `bg` in the outer shell
-behaves as for any other job.
+behaves as for any other job. Started in the background with `&`, it
+stays there: a command that reads from the terminal stops until `fg`.
+Without a terminal, `SIGINT`, `SIGQUIT`, `SIGTERM` and `SIGHUP` sent to
+`sand` are passed to the command. If `sand` itself is killed, the
+sandbox and everything in it ends with it.
 
 ## Flags
 

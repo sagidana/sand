@@ -171,17 +171,33 @@ static int foreground = 0;
 /* init tells sand that the command stopped: one byte, the signal. */
 static int stop_pipe[2] = {-1, -1};
 
+static void report(const char *fmt, va_list ap, int saved_errno)
+{
+    fprintf(stderr, "sand: ");
+    vfprintf(stderr, fmt, ap);
+    if (saved_errno != 0) fprintf(stderr, ": %s", strerror(saved_errno));
+    fprintf(stderr, "\n");
+}
+
+/* Exit with a message followed by the errno text. */
 static void die(const char *fmt, ...)
 {
     va_list ap;
-    int saved_errno = errno;
 
-    fprintf(stderr, "sand: ");
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    report(fmt, ap, errno);
     va_end(ap);
-    if (saved_errno != 0) fprintf(stderr, ": %s", strerror(saved_errno));
-    fprintf(stderr, "\n");
+    exit(1);
+}
+
+/* Exit with a message alone, for errors that are not a failed call. */
+static void fail(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    report(fmt, ap, 0);
+    va_end(ap);
     exit(1);
 }
 
@@ -353,6 +369,14 @@ static void build_root(const char *cwd)
     int i;
     int fd;
 
+    /* Opened here, inside the new mount namespace: the kernel refuses to
+     * bind from an fd that belongs to another namespace. */
+    for (i = 0; i < bind_count; i++) {
+        if (binds[i].hide) continue;
+        binds[i].fd = open(binds[i].path, O_PATH);
+        if (binds[i].fd < 0) die("open %s", binds[i].path);
+    }
+
     /* Keep every mount change private to this namespace. */
     if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) die("make / private");
 
@@ -378,6 +402,7 @@ static void build_root(const char *cwd)
     close(fd);
     for (i = 0; i < bind_count; i++) {
         add_bind(&binds[i]);
+        if (!binds[i].hide) close(binds[i].fd);
     }
     /* The hidden files keep the inode; the name can go. */
     if (unlink(EMPTY_FILE) < 0) die("unlink %s", EMPTY_FILE);
@@ -479,7 +504,8 @@ static void relay_stop(int sig, pid_t init)
     killpg(group, SIGCONT);
 }
 
-/* In sand: wait for init, relaying stops of the command meanwhile. */
+/* In sand: wait for init, relaying stops of the command meanwhile when
+ * there is a terminal (the stop pipe is -1 otherwise). */
 static int wait_for_init(pid_t init)
 {
     struct pollfd fds[2];
@@ -530,6 +556,11 @@ static int exit_status(int status)
 #error "unsupported architecture"
 #endif
 
+/* Hand a syscall to init. */
+#define TRAP(nr) \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1), \
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF)
+
 /* Installed in the command right before exec. The listed calls are
  * handed to init; everything else runs normally. io_uring is refused
  * because it could issue the same calls without passing through here.
@@ -541,14 +572,10 @@ static int install_filter(void)
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SAND_ARCH, 1, 0),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_connect, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sendmsg, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sendmmsg, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+        TRAP(__NR_connect),
+        TRAP(__NR_bind),
+        TRAP(__NR_sendmsg),
+        TRAP(__NR_sendmmsg),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
         /* sendto only when an address is given: args[4] (64-bit) != 0.
@@ -567,10 +594,7 @@ static int install_filter(void)
     prog.len = sizeof(filter) / sizeof(filter[0]);
     prog.filter = filter;
     listener = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
-    if (listener < 0 && errno == EBUSY) {
-        errno = 0;
-        die("--allow/--block cannot be used inside a sandbox that already has them (the kernel allows one listener); the outer rules still apply");
-    }
+    if (listener < 0 && errno == EBUSY) fail("--allow/--block cannot be used inside a sandbox that already has them (the kernel allows one listener); the outer rules still apply");
     if (listener < 0) die("seccomp");
     return listener;
 }
@@ -585,7 +609,6 @@ static int install_filter(void)
 struct request {
     int listener;
     struct seccomp_notif notif;
-    pid_t pid;
     int sock;
 };
 
@@ -739,7 +762,7 @@ static void do_connect_or_bind(struct request *req, struct seccomp_notif_resp *r
 
     memset(&ss, 0, sizeof(ss));
     if (len > sizeof(ss)) len = sizeof(ss);
-    if (read_mem(req->pid, req->notif.data.args[1], &ss, len) < 0) {
+    if (read_mem(req->notif.pid, req->notif.data.args[1], &ss, len) < 0) {
         resp->error = -EFAULT;
         return;
     }
@@ -780,7 +803,7 @@ static long send_pieces(struct request *req, const struct iovec *remote_iov, int
     buf = malloc(total + 1);
     if (buf == NULL) return -ENOMEM;
     for (i = 0; i < count; i++) {
-        if (read_mem(req->pid, (unsigned long)remote_iov[i].iov_base, buf + off, remote_iov[i].iov_len) < 0) {
+        if (read_mem(req->notif.pid, (unsigned long)remote_iov[i].iov_base, buf + off, remote_iov[i].iov_len) < 0) {
             free(buf);
             return -EFAULT;
         }
@@ -793,7 +816,7 @@ static long send_pieces(struct request *req, const struct iovec *remote_iov, int
     memset(&mh, 0, sizeof(mh));
     if (name_addr != 0 && name_len > 0) {
         if (name_len > sizeof(ss)) name_len = sizeof(ss);
-        if (read_mem(req->pid, name_addr, &ss, name_len) < 0) {
+        if (read_mem(req->notif.pid, name_addr, &ss, name_len) < 0) {
             free(buf);
             return -EFAULT;
         }
@@ -816,19 +839,20 @@ static long send_pieces(struct request *req, const struct iovec *remote_iov, int
     return r;
 }
 
+/* Bytes sent or -errno into the response. */
+static void set_result(struct seccomp_notif_resp *resp, long r)
+{
+    if (r < 0) resp->error = r;
+    else resp->val = r;
+}
+
 static void do_sendto(struct request *req, struct seccomp_notif_resp *resp)
 {
     struct iovec piece;
-    long r;
 
     piece.iov_base = (void *)(unsigned long)req->notif.data.args[1];
     piece.iov_len = req->notif.data.args[2];
-    r = send_pieces(req, &piece, 1, req->notif.data.args[4], req->notif.data.args[5], req->notif.data.args[3]);
-    if (r < 0) {
-        resp->error = r;
-    } else {
-        resp->val = r;
-    }
+    set_result(resp, send_pieces(req, &piece, 1, req->notif.data.args[4], req->notif.data.args[5], req->notif.data.args[3]));
 }
 
 /* A msghdr already copied from the command; its iov array still has to be. */
@@ -838,25 +862,19 @@ static long send_remote_msghdr(struct request *req, const struct msghdr *mh, int
 
     if (mh->msg_control != NULL && mh->msg_controllen > 0) return -EPERM;
     if (mh->msg_iovlen > MAX_IOV) return -EMSGSIZE;
-    if (read_mem(req->pid, (unsigned long)mh->msg_iov, remote_iov, mh->msg_iovlen * sizeof(struct iovec)) < 0) return -EFAULT;
+    if (read_mem(req->notif.pid, (unsigned long)mh->msg_iov, remote_iov, mh->msg_iovlen * sizeof(struct iovec)) < 0) return -EFAULT;
     return send_pieces(req, remote_iov, mh->msg_iovlen, (unsigned long)mh->msg_name, mh->msg_namelen, flags);
 }
 
 static void do_sendmsg(struct request *req, struct seccomp_notif_resp *resp)
 {
     struct msghdr mh;
-    long r;
 
-    if (read_mem(req->pid, req->notif.data.args[1], &mh, sizeof(mh)) < 0) {
+    if (read_mem(req->notif.pid, req->notif.data.args[1], &mh, sizeof(mh)) < 0) {
         resp->error = -EFAULT;
         return;
     }
-    r = send_remote_msghdr(req, &mh, req->notif.data.args[2]);
-    if (r < 0) {
-        resp->error = r;
-    } else {
-        resp->val = r;
-    }
+    set_result(resp, send_remote_msghdr(req, &mh, req->notif.data.args[2]));
 }
 
 static void do_sendmmsg(struct request *req, struct seccomp_notif_resp *resp)
@@ -869,7 +887,7 @@ static void do_sendmmsg(struct request *req, struct seccomp_notif_resp *resp)
     long r = 0;
 
     if (count > MAX_MSGS) count = MAX_MSGS;
-    if (read_mem(req->pid, base, msgs, count * sizeof(msgs[0])) < 0) {
+    if (read_mem(req->notif.pid, base, msgs, count * sizeof(msgs[0])) < 0) {
         resp->error = -EFAULT;
         return;
     }
@@ -877,7 +895,7 @@ static void do_sendmmsg(struct request *req, struct seccomp_notif_resp *resp)
         r = send_remote_msghdr(req, &msgs[i].msg_hdr, req->notif.data.args[3]);
         if (r < 0) break;
         msgs[i].msg_len = r;
-        write_mem(req->pid, base + i * sizeof(msgs[0]) + offsetof(struct mmsghdr, msg_len), &msgs[i].msg_len, sizeof(msgs[i].msg_len));
+        write_mem(req->notif.pid, base + i * sizeof(msgs[0]) + offsetof(struct mmsghdr, msg_len), &msgs[i].msg_len, sizeof(msgs[i].msg_len));
         sent++;
     }
     if (sent == 0 && r < 0) {
@@ -902,8 +920,7 @@ static void handle_request(int listener)
     }
     memset(&resp, 0, sizeof(resp));
     resp.id = req.notif.id;
-    req.pid = req.notif.pid;
-    req.sock = take_socket(req.pid, req.notif.data.args[0]);
+    req.sock = take_socket(req.notif.pid, req.notif.data.args[0]);
 
     if (req.sock < 0) {
         resp.error = -EBADF;
@@ -929,7 +946,8 @@ static void handle_request(int listener)
     if (ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, &resp) < 0 && errno != ENOENT) die("seccomp respond");
 }
 
-/* Serve requests until the command exits; returns its wait status. */
+/* Reap until the command exits, serving broker requests meanwhile when
+ * there is a listener (-1 otherwise); returns the command's wait status. */
 static int supervise(int listener, pid_t child)
 {
     struct pollfd fds[2];
@@ -1074,9 +1092,6 @@ static void loopback_up(void)
 static int run_init(const char *cwd)
 {
     pid_t child;
-    pid_t pid;
-    int status;
-    int i;
     int number;
     int pidfd;
     int listener = -1;
@@ -1100,19 +1115,8 @@ static int run_init(const char *cwd)
     sigaddset(&chld, SIGCHLD);
     sigprocmask(SIG_BLOCK, &chld, NULL);
 
-    /* Opened here, inside the new mount namespace: the kernel refuses to
-     * bind from an fd that belongs to another namespace. */
-    for (i = 0; i < bind_count; i++) {
-        if (binds[i].hide) continue;
-        binds[i].fd = open(binds[i].path, O_PATH);
-        if (binds[i].fd < 0) die("open %s", binds[i].path);
-    }
     if (!host_network) loopback_up();
     build_root(cwd);
-    for (i = 0; i < bind_count; i++) {
-        if (binds[i].hide) continue;
-        close(binds[i].fd);
-    }
     if (sethostname("sand", 4) < 0) die("sethostname");
 
     if (rule_count > 0) {
@@ -1138,19 +1142,7 @@ static int run_init(const char *cwd)
         }
         close(notify_socket[0]);
     }
-    if (listener >= 0) return exit_status(supervise(listener, child));
-
-    for (;;) {
-        pid = waitpid(-1, &status, WUNTRACED);
-        if (pid < 0) {
-            if (errno == EINTR) continue;
-            die("wait");
-        }
-        if (pid != child) continue;
-        if (WIFSTOPPED(status)) report_stop(status);
-        else break;
-    }
-    return exit_status(status);
+    return exit_status(supervise(listener, child));
 }
 
 static void enter_namespaces(void)
@@ -1184,10 +1176,7 @@ static char *expand_home(const char *arg)
         return path;
     }
     home = getenv("HOME");
-    if (home == NULL) {
-        errno = 0;
-        die("%s: HOME is not set", arg);
-    }
+    if (home == NULL) fail("%s: HOME is not set", arg);
     if (asprintf(&path, "%s%s", home, arg + 1) < 0) die("asprintf");
     return path;
 }
@@ -1197,20 +1186,14 @@ static void add_path(const char *arg, int read_only, int hide)
     char *expanded;
     char *path;
 
-    if (bind_count == MAX_BINDS) {
-        errno = 0;
-        die("too many paths (max %d)", MAX_BINDS);
-    }
+    if (bind_count == MAX_BINDS) fail("too many paths (max %d)", MAX_BINDS);
     expanded = expand_home(arg);
     path = realpath(expanded, NULL);
     free(expanded);
     /* A path that does not exist is already invisible. */
     if (path == NULL && hide && errno == ENOENT) return;
     if (path == NULL) die("%s", arg);
-    if (strcmp(path, "/") == 0) {
-        errno = 0;
-        die("refusing to bind the root directory");
-    }
+    if (strcmp(path, "/") == 0) fail("refusing to bind the root directory");
     binds[bind_count].path = path;
     binds[bind_count].dst = path;
     binds[bind_count].read_only = read_only;
@@ -1256,10 +1239,7 @@ static int parse_number(const char *text, int lo, int hi, const char *what)
 
     errno = 0;
     value = strtol(text, &end, 10);
-    if (*text == '\0' || *end != '\0' || value < lo || value > hi) {
-        errno = 0;
-        die("bad %s: %s", what, text);
-    }
+    if (*text == '\0' || *end != '\0' || value < lo || value > hi) fail("bad %s: %s", what, text);
     return value;
 }
 
@@ -1278,8 +1258,7 @@ static void parse_address(char *text, struct rule *r)
         r->family = AF_INET6;
         max = 128;
     } else {
-        errno = 0;
-        die("bad address: %s", text);
+        fail("bad address: %s", text);
     }
     r->prefix = max;
     if (slash != NULL) r->prefix = parse_number(slash + 1, 0, max, "prefix");
@@ -1297,10 +1276,7 @@ static void parse_ports(char *text, struct rule *r)
     *dash = '\0';
     r->port_lo = parse_number(text, 0, 65535, "port");
     r->port_hi = parse_number(dash + 1, 0, 65535, "port");
-    if (r->port_lo > r->port_hi) {
-        errno = 0;
-        die("bad port range: %s-%s", text, dash + 1);
-    }
+    if (r->port_lo > r->port_hi) fail("bad port range: %s-%s", text, dash + 1);
 }
 
 /* RULE = [src:][ADDR[/PREFIX]][:PORT[-PORT]] | all
@@ -1315,10 +1291,7 @@ static void add_rule(const char *arg, int allow)
     char *end;
     struct rule *r;
 
-    if (rule_count == MAX_RULES) {
-        errno = 0;
-        die("too many rules (max %d)", MAX_RULES);
-    }
+    if (rule_count == MAX_RULES) fail("too many rules (max %d)", MAX_RULES);
     r = &rules[rule_count];
     memset(r, 0, sizeof(*r));
     r->allow = allow;
@@ -1334,10 +1307,7 @@ static void add_rule(const char *arg, int allow)
     if (*p == '[') {
         addr = p + 1;
         end = strchr(addr, ']');
-        if (end == NULL) {
-            errno = 0;
-            die("bad rule: %s", arg);
-        }
+        if (end == NULL) fail("bad rule: %s", arg);
         *end = '\0';
         ports = end + 1;
         if (*ports == ':') ports++;
@@ -1356,10 +1326,7 @@ static void add_rule(const char *arg, int allow)
 
     if (addr != NULL && *addr != '\0') parse_address(addr, r);
     if (ports != NULL && *ports != '\0') parse_ports(ports, r);
-    if ((addr == NULL || *addr == '\0') && (ports == NULL || *ports == '\0')) {
-        errno = 0;
-        die("bad rule: %s", arg);
-    }
+    if ((addr == NULL || *addr == '\0') && (ports == NULL || *ports == '\0')) fail("bad rule: %s", arg);
     rule_count++;
 }
 
@@ -1369,10 +1336,7 @@ static void add_env(const char *arg)
     const char *value;
     char *entry;
 
-    if (extra_env_count == MAX_ENV) {
-        errno = 0;
-        die("too many --env entries (max %d)", MAX_ENV);
-    }
+    if (extra_env_count == MAX_ENV) fail("too many --env entries (max %d)", MAX_ENV);
     if (strchr(arg, '=') != NULL) {
         entry = strdup(arg);
         if (entry == NULL) die("strdup");
@@ -1398,8 +1362,7 @@ static void set_net(const char *arg)
         host_network = 1;
         return;
     }
-    errno = 0;
-    die("--net: expected none or host, got %s", arg);
+    fail("--net: expected none or host, got %s", arg);
 }
 
 /* Profiles are files of flags under $XDG_CONFIG_HOME/sand, by default
@@ -1418,20 +1381,14 @@ static char *profile_path(const char *name)
     const char *home;
     char *path;
 
-    if (name[0] == '\0' || strchr(name, '/') != NULL) {
-        errno = 0;
-        die("profile: expected a plain name, got %s", name);
-    }
+    if (name[0] == '\0' || strchr(name, '/') != NULL) fail("profile: expected a plain name, got %s", name);
     base = getenv("XDG_CONFIG_HOME");
     if (base != NULL && base[0] != '\0') {
         if (asprintf(&path, "%s/sand/%s", base, name) < 0) die("asprintf");
         return path;
     }
     home = getenv("HOME");
-    if (home == NULL) {
-        errno = 0;
-        die("profile %s: HOME is not set", name);
-    }
+    if (home == NULL) fail("profile %s: HOME is not set", name);
     if (asprintf(&path, "%s/.config/sand/%s", home, name) < 0) die("asprintf");
     return path;
 }
@@ -1447,10 +1404,7 @@ static void load_profile(const char *name, int required)
     char *flag;
     char *value;
 
-    if (profile_depth == MAX_PROFILE_DEPTH) {
-        errno = 0;
-        die("profile %s: nested too deep (a loop?)", name);
-    }
+    if (profile_depth == MAX_PROFILE_DEPTH) fail("profile %s: nested too deep (a loop?)", name);
     path = profile_path(name);
     file = fopen(path, "r");
     if (file == NULL) {
@@ -1476,14 +1430,8 @@ static void load_profile(const char *name, int required)
             value++;
             value += strspn(value, " \t");
         }
-        if (*value == '\0') {
-            errno = 0;
-            die("%s:%d: %s needs a value", path, lineno, flag);
-        }
-        if (!apply_flag(flag, value)) {
-            errno = 0;
-            die("%s:%d: unknown flag %s", path, lineno, flag);
-        }
+        if (*value == '\0') fail("%s:%d: %s needs a value", path, lineno, flag);
+        if (!apply_flag(flag, value)) fail("%s:%d: unknown flag %s", path, lineno, flag);
     }
     if (ferror(file)) die("profile %s", path);
     profile_depth--;
@@ -1556,16 +1504,12 @@ int main(int argc, char **argv)
 {
     char cwd[PATH_MAX];
     pid_t init;
-    pid_t pid;
     int status;
     int i;
     const char *name;
 
     if (getcwd(cwd, sizeof(cwd)) == NULL) die("getcwd");
-    if (strcmp(cwd, "/") == 0) {
-        errno = 0;
-        die("refusing to sandbox the root directory");
-    }
+    if (strcmp(cwd, "/") == 0) fail("refusing to sandbox the root directory");
     add_path(cwd, 1, 0);
     add_resolv_conf();
 
@@ -1593,10 +1537,7 @@ int main(int argc, char **argv)
         i++;
     }
 
-    if (rule_count > 0 && !host_network) {
-        errno = 0;
-        die("--allow and --block need --net host");
-    }
+    if (rule_count > 0 && !host_network) fail("--allow and --block need --net host");
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) die("no_new_privs");
     find_terminal();
@@ -1614,19 +1555,8 @@ int main(int argc, char **argv)
     forward_to = init;
     install_signal_handlers();
 
-    if (tty_fd >= 0) {
-        close(stop_pipe[1]);
-        status = wait_for_init(init);
-        if (foreground) give_terminal(tty_pgrp);
-        return exit_status(status);
-    }
-    for (;;) {
-        pid = waitpid(init, &status, 0);
-        if (pid < 0) {
-            if (errno == EINTR) continue;
-            die("waitpid");
-        }
-        break;
-    }
+    if (tty_fd >= 0) close(stop_pipe[1]);
+    status = wait_for_init(init);
+    if (foreground) give_terminal(tty_pgrp);
     return exit_status(status);
 }

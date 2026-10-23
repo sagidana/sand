@@ -141,9 +141,13 @@ gives 127, one that cannot be executed gives 126, like a shell.
 
 Rules apply in order and a later rule wins. As soon as any `--allow`
 is given, everything not allowed is blocked. Destination rules apply
-to `connect` and to UDP sends that carry an address; `src:` rules apply
-to `bind`, which covers listening sockets and explicit source ports.
-A blocked call fails with "Network is unreachable" (EACCES for bind)
+to `connect` and to UDP sends that carry an address; `0.0.0.0` and `::`
+as a destination mean this host and are matched as `127.0.0.1` and
+`::1`. `src:` rules apply to `bind`, which covers listening sockets
+and explicit source ports, and to `listen` on a socket that was never
+bound, which would otherwise take a port of its own: that counts as a
+bind to port 0 on every address. A blocked call fails with "Network is
+unreachable" (EACCES for bind and listen)
 and a line on stderr names the address, which helps when wrapping a
 program whose network needs are not documented.
 
@@ -152,8 +156,8 @@ program whose network needs are not documented.
     sand --net host --allow 10.0.0.0/8 --block 10.1.0.0/16 ./app
 
 How it works: the command runs under a seccomp filter that hands
-`connect`, `bind`, `sendmsg`, `sendmmsg` and address-carrying `sendto`
-to the sandbox's init process. Init takes a handle on the command's
+`connect`, `bind`, `listen`, `sendmsg`, `sendmmsg` and address-carrying
+`sendto` to the sandbox's init process. Init takes a handle on the command's
 socket, copies the address out of the command's memory, checks the
 rules and performs the call itself. Because the kernel never re-reads
 the command's memory, a thread changing the address after the check

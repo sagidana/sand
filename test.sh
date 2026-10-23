@@ -211,6 +211,16 @@ PY
         --net host --block :1 --ro "$T/stall.py" bash -c "python3 $T/stall.py $PORT & sleep 1; timeout 5 bash -c '$connect'; kill \$!"
     expect "src: rule blocks bind" 1 "*ermission*" \
         --net host --block src:all python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0))'
+    expect "src: rule blocks listen on an unbound socket" 1 "*blocked bind to 0.0.0.0 port 0*ermission*" \
+        --net host --block src:all python3 -c 'import socket; s=socket.socket(); s.listen()'
+    expect "src: allow elsewhere blocks an unbound listen" 1 "*ermission*" \
+        --net host --allow src:127.0.0.1 python3 -c 'import socket; s=socket.socket(); s.listen()'
+    expect "listen on an allowed bound socket passes" 0 "ok" \
+        --net host --allow src:127.0.0.1 python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(); print("ok")'
+    expect "0.0.0.0 as a destination counts as loopback" 1 "*blocked connection to 0.0.0.0*unreachable*" \
+        --net host --block 127.0.0.0/8 bash -c "exec 3<>/dev/tcp/0.0.0.0/$PORT"
+    expect "0.0.0.0 passes when loopback is allowed" 0 "connected" \
+        --net host --allow 127.0.0.1:$PORT bash -c "exec 3<>/dev/tcp/0.0.0.0/$PORT && echo connected"
     expect "filtered inside filtered is refused" 1 "*cannot be used inside*" \
         --net host --block all --ro "$SAND" "$SAND" --net host --block all true
     expect "unfiltered inside filtered keeps outer rules" 1 "*unreachable*" \

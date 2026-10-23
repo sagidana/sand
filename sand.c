@@ -579,6 +579,7 @@ static int install_filter(void)
         TRAP(__NR_bind),
         TRAP(__NR_sendmsg),
         TRAP(__NR_sendmmsg),
+        TRAP(__NR_listen),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
         /* sendto only when an address is given: args[4] (64-bit) != 0.
@@ -709,13 +710,18 @@ static int rule_matches(const struct rule *r, int family, const unsigned char *a
 
 /* Decide for one socket address. The default is allow, or deny as soon
  * as any --allow exists for that direction. Non-IP addresses are left to
- * the kernel, which will reject them on an IP socket. */
+ * the kernel, which will reject them on an IP socket. As a destination
+ * 0.0.0.0 or :: means this host and is judged as loopback. */
 static int address_allowed(const struct sockaddr_storage *ss, socklen_t len, int src)
 {
     static const unsigned char mapped[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+    static const unsigned char zero[16];
+    static const unsigned char loop4[4] = { 127, 0, 0, 1 };
+    static const unsigned char loop6[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     const struct sockaddr_in *in4;
     const struct sockaddr_in6 *in6;
     const unsigned char *addr;
+    const unsigned char *match;
     char text[INET6_ADDRSTRLEN];
     int family;
     int port;
@@ -740,13 +746,16 @@ static int address_allowed(const struct sockaddr_storage *ss, socklen_t len, int
     } else {
         return 1;
     }
+    match = addr;
+    if (!src && family == AF_INET && memcmp(addr, zero, 4) == 0) match = loop4;
+    if (!src && family == AF_INET6 && memcmp(addr, zero, 16) == 0) match = loop6;
 
     for (i = 0; i < rule_count; i++) {
         if (rules[i].src == src && rules[i].allow) allowed = 0;
     }
     for (i = 0; i < rule_count; i++) {
         if (rules[i].src != src) continue;
-        if (!rule_matches(&rules[i], family, addr, port)) continue;
+        if (!rule_matches(&rules[i], family, match, port)) continue;
         allowed = rules[i].allow;
     }
     if (!allowed) {
@@ -784,6 +793,30 @@ static void do_connect_or_bind(struct request *req, struct seccomp_notif_resp *r
         r = connect(req->sock, (struct sockaddr *)&ss, len);
     }
     if (r < 0) resp->error = -errno;
+}
+
+/* listen on a socket that was never bound binds it to a port of the
+ * kernel's choice on every address; judge that as a bind to port 0.
+ * A bound socket was checked at bind. listen itself carries no address,
+ * so it is left to run in the command. */
+static void do_listen(struct request *req, struct seccomp_notif_resp *resp)
+{
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    int port = -1;
+
+    memset(&ss, 0, sizeof(ss));
+    if (getsockname(req->sock, (struct sockaddr *)&ss, &len) < 0) {
+        resp->error = -errno;
+        return;
+    }
+    if (ss.ss_family == AF_INET) port = ((struct sockaddr_in *)&ss)->sin_port;
+    if (ss.ss_family == AF_INET6) port = ((struct sockaddr_in6 *)&ss)->sin6_port;
+    if (port == 0 && !address_allowed(&ss, len, 1)) {
+        resp->error = -EACCES;
+        return;
+    }
+    resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 }
 
 /* Send data read from the command's memory, to the given address if any.
@@ -908,15 +941,16 @@ static void do_sendmmsg(struct request *req, struct seccomp_notif_resp *resp)
     }
 }
 
-/* Whether performing the call could block init: bind never does, nor
- * does anything on a non-blocking socket or a send with MSG_DONTWAIT. */
+/* Whether performing the call could block init: bind and listen never
+ * do, nor does anything on a non-blocking socket or a send with
+ * MSG_DONTWAIT. */
 static int may_block(const struct request *req)
 {
     int nr = req->notif.data.nr;
     int flags = 0;
     int fl;
 
-    if (nr == __NR_bind) return 0;
+    if (nr == __NR_bind || nr == __NR_listen) return 0;
     if (nr == __NR_sendto) flags = req->notif.data.args[3];
     if (nr == __NR_sendmsg) flags = req->notif.data.args[2];
     if (nr == __NR_sendmmsg) flags = req->notif.data.args[3];
@@ -968,6 +1002,8 @@ static void handle_request(int listener)
         resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
     } else if (req.notif.data.nr == __NR_connect || req.notif.data.nr == __NR_bind) {
         do_connect_or_bind(&req, &resp);
+    } else if (req.notif.data.nr == __NR_listen) {
+        do_listen(&req, &resp);
     } else if (req.notif.data.nr == __NR_sendto) {
         do_sendto(&req, &resp);
     } else if (req.notif.data.nr == __NR_sendmsg) {
@@ -1531,7 +1567,7 @@ static void usage(void)
     fprintf(stderr, "  --block RULE       with --net host: block matching traffic\n");
     fprintf(stderr, "    RULE = [src:][ADDR[/PREFIX]][:PORT[-PORT]] | all\n");
     fprintf(stderr, "    e.g. 10.0.0.0/8:443  1.1.1.1  :53  8000-9000  [::1]:80  src:8080\n");
-    fprintf(stderr, "    src: rules apply to bind (listening and explicit source ports)\n");
+    fprintf(stderr, "    src: rules apply to bind and to listen (listening and explicit source ports)\n");
     fprintf(stderr, "  COMMAND [ARG]...   run COMMAND instead of $SHELL; -- before it if it starts with -\n");
     fprintf(stderr, "Flags may repeat; a later flag wins. Use --rw . for a writable cwd.\n");
     fprintf(stderr, "The profile ~/.config/sand/default, if present, is loaded first.\n");

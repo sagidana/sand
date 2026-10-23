@@ -1,5 +1,5 @@
 /*
- * sandbox - run a command (default: a shell) in the current directory
+ * sand - run a command (default: a shell) in the current directory
  * with restrictions.
  *
  * The shell runs in its own user, mount, pid, net, ipc and uts namespaces.
@@ -19,7 +19,7 @@
  * memory first is what makes this race-free.
  *
  * Process layout:
- *   sandbox (host)  ->  init (pid 1 in the sandbox)  ->  command
+ *   sand (host)  ->  init (pid 1 in the sandbox)  ->  command
  * init reaps orphans and forwards SIGTERM/SIGHUP to the command.
  */
 
@@ -142,7 +142,7 @@ static void die(const char *fmt, ...)
     va_list ap;
     int saved_errno = errno;
 
-    fprintf(stderr, "sandbox: ");
+    fprintf(stderr, "sand: ");
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -388,9 +388,9 @@ static int exit_status(int status)
 }
 
 #if defined(__x86_64__)
-#define SANDBOX_ARCH AUDIT_ARCH_X86_64
+#define SAND_ARCH AUDIT_ARCH_X86_64
 #elif defined(__aarch64__)
-#define SANDBOX_ARCH AUDIT_ARCH_AARCH64
+#define SAND_ARCH AUDIT_ARCH_AARCH64
 #else
 #error "unsupported architecture"
 #endif
@@ -403,7 +403,7 @@ static int install_filter(void)
 {
     struct sock_filter filter[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SANDBOX_ARCH, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SAND_ARCH, 1, 0),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_connect, 0, 1),
@@ -590,7 +590,7 @@ static int address_allowed(const struct sockaddr_storage *ss, socklen_t len, int
     }
     if (!allowed) {
         inet_ntop(family, addr, text, sizeof(text));
-        fprintf(stderr, "sandbox: blocked %s %s port %d\n", src ? "bind to" : "connection to", text, port);
+        fprintf(stderr, "sand: blocked %s %s port %d\n", src ? "bind to" : "connection to", text, port);
     }
     return allowed;
 }
@@ -860,7 +860,7 @@ static void run_command(void)
         env[n] = extra_env[i];
         n++;
     }
-    env[n] = "SANDBOX=1";
+    env[n] = "SAND=1";
     n++;
     env[n] = NULL;
 
@@ -877,7 +877,7 @@ static void run_command(void)
     if (command != NULL) {
         execvpe(command[0], command, env);
         /* Same codes a shell uses, so callers can tell these apart. */
-        fprintf(stderr, "sandbox: %s: %s\n", command[0], strerror(errno));
+        fprintf(stderr, "sand: %s: %s\n", command[0], strerror(errno));
         if (errno == ENOENT) exit(127);
         exit(126);
     }
@@ -928,7 +928,7 @@ static int run_init(const char *cwd)
         if (binds[i].hide) continue;
         close(binds[i].fd);
     }
-    if (sethostname("sandbox", 7) < 0) die("sethostname");
+    if (sethostname("sand", 4) < 0) die("sethostname");
 
     if (rule_count > 0) {
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, notify_socket) < 0) die("socketpair");
@@ -1188,7 +1188,7 @@ static void set_net(const char *arg)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: sandbox [--ro PATH | --rw PATH | --hide PATH | --env NAME[=VALUE] | --net MODE]... [-- COMMAND [ARG]...]\n");
+    fprintf(stderr, "usage: sand [--ro PATH | --rw PATH | --hide PATH | --env NAME[=VALUE] | --net MODE]... [-- COMMAND [ARG]...]\n");
     fprintf(stderr, "  --ro PATH          also make PATH visible, read-only\n");
     fprintf(stderr, "  --rw PATH          also make PATH visible, writable\n");
     fprintf(stderr, "  --hide PATH        make a visible PATH appear empty\n");

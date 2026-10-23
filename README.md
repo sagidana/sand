@@ -1,12 +1,12 @@
-# sandbox
+# sand
 
 Run a command, or an interactive shell, in the current directory with
 restrictions. One C file, Linux only, no root, no dependencies.
 
-    sandbox                                   shell in the cwd, read-only, no network
-    sandbox -- python script.py               run a command instead of a shell
-    sandbox --rw out -- make                  one writable directory
-    sandbox --net host --allow :443 -- curl https://example.com
+    sand                                   shell in the cwd, read-only, no network
+    sand -- python script.py               run a command instead of a shell
+    sand --rw out -- make                  one writable directory
+    sand --net host --allow :443 -- curl https://example.com
 
 The sandbox is built from Linux namespaces: the command gets its own
 user, mount, pid, ipc and uts namespaces, and by default its own empty
@@ -16,7 +16,7 @@ root. Sandboxes nest.
 ## Build and install
 
     make
-    make install                 # /usr/local/bin/sandbox
+    make install                 # /usr/local/bin/sand
     make install PREFIX=~/.local # anywhere else
 
 Requires a Linux kernel of 5.6 or newer with unprivileged user
@@ -37,7 +37,7 @@ An empty root containing only:
 
 Nothing else from the host exists: no `/home`, no `/root`, no `/var`,
 no `/opt`, no `/run`, no `/sys`. The environment is reduced to `PATH`,
-`TERM`, `HOME`, `USER`, `LANG` and `SHELL`, plus `SANDBOX=1`. No-new-privs
+`TERM`, `HOME`, `USER`, `LANG` and `SHELL`, plus `SAND=1`. No-new-privs
 is set, so setuid programs such as `sudo` do nothing special.
 
 ## Flags
@@ -81,9 +81,9 @@ A blocked call fails with "Network is unreachable" (EACCES for bind)
 and a line on stderr names the address, which helps when wrapping a
 program whose network needs are not documented.
 
-    sandbox --net host --allow :53 --allow :443 -- pip install requests
-    sandbox --net host --block :25 -- ./app
-    sandbox --net host --allow 10.0.0.0/8 --block 10.1.0.0/16 -- ./app
+    sand --net host --allow :53 --allow :443 -- pip install requests
+    sand --net host --block :25 -- ./app
+    sand --net host --allow 10.0.0.0/8 --block 10.1.0.0/16 -- ./app
 
 How it works: the command runs under a seccomp filter that hands
 `connect`, `bind`, `sendmsg`, `sendmmsg` and address-carrying `sendto`
@@ -100,7 +100,7 @@ the outer rules.
 
 ## Nesting
 
-`sandbox` inside `sandbox` works, as long as the binary is visible
+`sand` inside `sand` works, as long as the binary is visible
 inside (it is if it is installed under `/usr`, or pass `--ro` for it).
 Each level can only restrict further.
 

@@ -3,16 +3,16 @@ CFLAGS  = -std=c11 -Wall -Wextra -O2
 PREFIX ?= /usr/local
 BINDIR  = $(DESTDIR)$(PREFIX)/bin
 
-sandbox: sandbox.c
+sand: sand.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-install: sandbox
-	install -D -m 755 sandbox $(BINDIR)/sandbox
+install: sand
+	install -D -m 755 sand $(BINDIR)/sand
 
 uninstall:
-	$(RM) $(BINDIR)/sandbox
+	$(RM) $(BINDIR)/sand
 
 clean:
-	$(RM) sandbox
+	$(RM) sand
 
 .PHONY: install uninstall clean

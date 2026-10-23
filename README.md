@@ -158,6 +158,9 @@ socket, copies the address out of the command's memory, checks the
 rules and performs the call itself. Because the kernel never re-reads
 the command's memory, a thread changing the address after the check
 gains nothing. Plain `send`, `write` and all receives are not trapped.
+A call that may block, such as `connect` on a blocking socket, is
+performed by a short-lived child of init, so a hung peer does not hold
+up the other sockets.
 
 The kernel allows one such filter per process chain, so a filtered
 sandbox cannot run inside another filtered sandbox. The inner one

@@ -16,7 +16,10 @@
  * filter in the command traps the socket calls that carry an address and
  * init, acting as a broker, checks the address and performs the call on
  * the command's own socket. Copying the address out of the command's
- * memory first is what makes this race-free.
+ * memory first is what makes this race-free. A call that may block,
+ * connect on a blocking socket or a send into a full buffer, is done by
+ * a short-lived child of init, so one hung peer does not hold up every
+ * other socket, the reaping and the stop relay.
  *
  * Process layout:
  *   sand (host)  ->  init (pid 1 in the sandbox)  ->  command
@@ -905,12 +908,34 @@ static void do_sendmmsg(struct request *req, struct seccomp_notif_resp *resp)
     }
 }
 
+/* Whether performing the call could block init: bind never does, nor
+ * does anything on a non-blocking socket or a send with MSG_DONTWAIT. */
+static int may_block(const struct request *req)
+{
+    int nr = req->notif.data.nr;
+    int flags = 0;
+    int fl;
+
+    if (nr == __NR_bind) return 0;
+    if (nr == __NR_sendto) flags = req->notif.data.args[3];
+    if (nr == __NR_sendmsg) flags = req->notif.data.args[2];
+    if (nr == __NR_sendmmsg) flags = req->notif.data.args[3];
+    if (flags & MSG_DONTWAIT) return 0;
+    fl = fcntl(req->sock, F_GETFL);
+    return fl >= 0 && !(fl & O_NONBLOCK);
+}
+
+/* One request: in init when it cannot block, otherwise in a child of
+ * init that answers it and exits. The child lives until the call
+ * returns, even if the command gave up meanwhile; the end of the
+ * sandbox ends it at the latest. */
 static void handle_request(int listener)
 {
     struct request req;
     struct seccomp_notif_resp resp;
     socklen_t len = sizeof(int);
     int domain;
+    pid_t worker = -1;
 
     memset(&req, 0, sizeof(req));
     req.listener = listener;
@@ -921,6 +946,17 @@ static void handle_request(int listener)
     memset(&resp, 0, sizeof(resp));
     resp.id = req.notif.id;
     req.sock = take_socket(req.notif.pid, req.notif.data.args[0]);
+
+    if (req.sock >= 0 && may_block(&req)) {
+        worker = fork();
+        if (worker < 0) die("fork");
+        if (worker > 0) {
+            close(req.sock);
+            return;
+        }
+        /* The signal handlers stay, but forward nothing from here. */
+        forward_to = 0;
+    }
 
     if (req.sock < 0) {
         resp.error = -EBADF;
@@ -944,10 +980,12 @@ static void handle_request(int listener)
 
     if (req.sock >= 0) close(req.sock);
     if (ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, &resp) < 0 && errno != ENOENT) die("seccomp respond");
+    if (worker == 0) _exit(0);
 }
 
 /* Reap until the command exits, serving broker requests meanwhile when
- * there is a listener (-1 otherwise); returns the command's wait status. */
+ * there is a listener (-1 otherwise); returns the command's wait status.
+ * The reaping also collects the request workers. */
 static int supervise(int listener, pid_t child)
 {
     struct pollfd fds[2];

@@ -173,9 +173,10 @@ s = socket.socket()
 s.bind(("127.0.0.1", 0))
 s.listen()
 open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+held = []
 while True:
     c, _ = s.accept()
-    c.close()
+    held.append(c)
 ' "$T/port" &
     LISTENER=$!
     for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -196,6 +197,18 @@ if [ -n "${PORT:-}" ]; then
         --net host --allow :1 bash -c "$connect"
     expect "later rule wins" 0 "connected" \
         --net host --block all --allow :$PORT bash -c "$connect"
+    # A blocking send into a peer that never reads hangs in the broker;
+    # a second socket must still be served meanwhile.
+    cat > "$T/stall.py" <<'PY'
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+s.connect(("127.0.0.1", int(sys.argv[1])))
+while True:
+    s.sendmsg([b"x" * 65536])
+PY
+    expect "a blocking send does not stall the broker" 0 "connected" \
+        --net host --block :1 --ro "$T/stall.py" bash -c "python3 $T/stall.py $PORT & sleep 1; timeout 5 bash -c '$connect'; kill \$!"
     expect "src: rule blocks bind" 1 "*ermission*" \
         --net host --block src:all python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0))'
     expect "filtered inside filtered is refused" 1 "*cannot be used inside*" \

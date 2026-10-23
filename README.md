@@ -47,6 +47,11 @@ no `/opt`, no `/run`, no `/sys`. The environment is reduced to `PATH`,
 `TERM`, `HOME`, `USER`, `LANG` and `SHELL`, plus `SAND=1`. No-new-privs
 is set, so setuid programs such as `sudo` do nothing special.
 
+The terminal belongs to the command while it runs, as with `sudo`:
+Ctrl-C and Ctrl-Z go to it, not to `sand`, a shell inside has working
+job control, and Ctrl-Z followed by `fg` or `bg` in the outer shell
+behaves as for any other job.
+
 ## Flags
 
     -p, --profile NAME   load the flags written in ~/.config/sand/NAME
@@ -104,9 +109,8 @@ place. Relative paths in a profile are relative to the directory
 that does not exist is a no-op, so one profile can serve machines
 with different dotfiles.
 
-The `profiles/` directory holds a few to start from; `make
-install-profiles` copies them to `~/.config/sand` without overwriting
-anything already there:
+The `profiles/` directory holds a few to start from; copy the ones
+you want to `~/.config/sand`:
 
     net      host network, but only name lookup and https
     lan      like net, plus the private address ranges

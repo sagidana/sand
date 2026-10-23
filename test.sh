@@ -181,6 +181,120 @@ expect "sand inside sand" 0 "inner" \
 expect "inner cannot widen" 1 "*Read-only file system" \
     --ro "$SAND" "$SAND" --rw . sh -c 'touch x'
 
+# --- terminal ---------------------------------------------------------
+# Drives an interactive bash on a pseudo-terminal. Steps: ">TEXT" types
+# a line, "^Z" and "^C" send the control character, "<TEXT" waits for
+# TEXT to appear, "!TEXT" says TEXT must never appear. The transcript
+# is printed on failure.
+tty_session() {
+    python3 - "$@" <<'PY'
+import os, pty, select, signal, sys, time
+
+steps = sys.argv[1:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["PS1"] = "P> "
+    os.environ["TERM"] = "dumb"
+    os.execvp("bash", ["bash", "--norc", "--noprofile", "-i"])
+
+out = b""
+pos = 0
+forbidden = []
+
+def read_some(timeout):
+    global out
+    ready, _, _ = select.select([fd], [], [], timeout)
+    if not ready:
+        return False
+    try:
+        data = os.read(fd, 4096)
+    except OSError:
+        return False
+    if not data:
+        return False
+    out += data
+    return True
+
+def finish(code, msg):
+    if msg:
+        print(msg)
+        print("transcript:")
+        print(out.decode("utf-8", "replace").replace("\r", ""))
+    os.close(fd)
+    try:
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+    sys.exit(code)
+
+def expect(text):
+    global pos
+    deadline = time.time() + 10
+    while out.find(text.encode(), pos) < 0:
+        if time.time() > deadline:
+            finish(1, "timed out waiting for: " + text)
+        read_some(0.2)
+    pos = out.find(text.encode(), pos) + len(text)
+
+expect("P> ")
+for step in steps:
+    if step == "^Z" or step == "^C":
+        time.sleep(0.5)
+        if step == "^Z":
+            os.write(fd, b"\x1a")
+        else:
+            os.write(fd, b"\x03")
+    elif step[0] == ">":
+        os.write(fd, step[1:].encode() + b"\n")
+    elif step[0] == "<":
+        expect(step[1:])
+    elif step[0] == "!":
+        forbidden.append(step[1:])
+os.write(fd, b"exit\n")
+deadline = time.time() + 5
+while time.time() < deadline and read_some(0.2):
+    pass
+for text in forbidden:
+    if text.encode() in out:
+        finish(1, "unwanted output: " + text)
+finish(0, "")
+PY
+}
+
+tty_case() {
+    local name=$1
+    shift
+    selected "$name" || return 0
+    if out=$(tty_session "$@" 2>&1); then
+        ok "$name"
+    else
+        bad "$name" "$out"
+    fi
+}
+
+if command -v python3 >/dev/null; then
+    printf 'tpgid=$(cut -d" " -f8 /proc/self/stat)\n[ "$tpgid" != 0 ] && echo visible || echo invisible:$tpgid\n' > "$T/tpgid.sh"
+    tty_case "tty: foreground group is visible inside" \
+        ">$SAND --ro $T sh $T/tpgid.sh" "<visible"
+    tty_case "tty: interactive dash exits quietly" \
+        ">$SAND -- sh -i" '<$ ' ">exit" ">echo do''ne:\$?" "<done:0" \
+        "!tty process group" "!can't access tty"
+    tty_case "tty: ctrl-z stops the job, fg resumes it, ctrl-c ends it" \
+        ">$SAND -- sleep 100" "^Z" "<Stopped" ">jobs" "<sleep 100" \
+        ">fg" "<sleep 100" "^C" ">echo rc=\$?" "<rc=130"
+    tty_case "tty: ctrl-z and fg with network rules" \
+        ">$SAND --net host --block all -- sleep 100" "^Z" "<Stopped" \
+        ">fg" "<sleep 100" "^C" ">echo rc=\$?" "<rc=130"
+    tty_case "tty: bg continues the job without the terminal" \
+        ">$SAND -- sleep 100" "^Z" "<Stopped" ">bg" "<sleep 100" ">jobs" "<Running" \
+        ">kill %1; wait %1; echo rc=\$?" "<rc=143"
+    tty_case "tty: inner shell job control" \
+        ">$SAND -- bash --norc -i" ">sleep 100 &" ">jobs" "<Running" \
+        ">kill %1; wait; echo jo''bs-ok" "<jobs-ok" ">exit" ">echo do''ne:\$?" "<done:0"
+else
+    skipped "terminal cases" "python3 not found"
+fi
+
 # --- profiles ---------------------------------------------------------
 
 profile net "# comment" "net host" "allow :53" "" "allow :443"

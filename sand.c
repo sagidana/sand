@@ -21,6 +21,17 @@
  * Process layout:
  *   sand (host)  ->  init (pid 1 in the sandbox)  ->  command
  * init reaps orphans and forwards SIGTERM/SIGHUP to the command.
+ *
+ * Terminal: the foreground process group the shell gave sand has no
+ * visible id inside the pid namespace, so job control in the command
+ * would see 0. Init therefore forms its own group and takes the
+ * terminal; the command inherits that group. Ctrl-C and Ctrl-Z then
+ * reach only init and the command. Init itself cannot be stopped (the
+ * kernel drops default-action signals aimed at a namespace's pid 1),
+ * so when the command stops init reports it over a pipe and sand stops
+ * itself: the host shell sees its job stop. On fg sand hands the
+ * terminal back to the command's group and continues it, and on bg
+ * continues it without the terminal. The same model as sudo.
  */
 
 #define _GNU_SOURCE
@@ -43,6 +54,7 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -136,6 +148,14 @@ static int extra_env_count = 0;
 
 /* The process that signals get forwarded to. */
 static pid_t forward_to = 0;
+
+/* The controlling terminal, or -1, and the group that held it when
+ * sand started, to be restored on exit. */
+static int tty_fd = -1;
+static pid_t tty_pgrp = 0;
+
+/* init tells sand that the command stopped: one byte, the signal. */
+static int stop_pipe[2] = {-1, -1};
 
 static void die(const char *fmt, ...)
 {
@@ -378,6 +398,97 @@ static void install_signal_handlers(void)
     /* The terminal delivers these to the shell directly. */
     signal(SIGINT, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
+}
+
+static void find_terminal(void)
+{
+    int fd;
+
+    for (fd = 0; fd <= 2; fd++) {
+        tty_pgrp = tcgetpgrp(fd);
+        if (tty_pgrp < 0) continue;
+        tty_fd = fd;
+        return;
+    }
+}
+
+/* Hands the terminal to a process group. A caller outside the
+ * foreground group would be stopped by SIGTTOU, so that is ignored for
+ * the call. The group id is read in the caller's pid namespace. */
+static int give_terminal(pid_t pgrp)
+{
+    struct sigaction ignore;
+    struct sigaction saved;
+    int result;
+
+    memset(&ignore, 0, sizeof(ignore));
+    ignore.sa_handler = SIG_IGN;
+    sigaction(SIGTTOU, &ignore, &saved);
+    result = tcsetpgrp(tty_fd, pgrp);
+    sigaction(SIGTTOU, &saved, NULL);
+    return result;
+}
+
+/* In init: the command stopped, tell sand. */
+static void report_stop(int status)
+{
+    char sig = WSTOPSIG(status);
+
+    if (stop_pipe[1] < 0) return;
+    if (write(stop_pipe[1], &sig, 1) < 0) die("write to sand");
+}
+
+/* In sand: the command stopped. Stop the same way so the host shell
+ * reports its job stopped; this returns when the shell continues us.
+ * With fg the shell has given us the terminal, pass it on to the
+ * command's group and continue it; with bg continue it without the
+ * terminal, so it stops again if it touches the terminal. The group
+ * is read here on the host, where it has a visible id. */
+static void relay_stop(int sig, pid_t init)
+{
+    pid_t group;
+
+    group = tcgetpgrp(tty_fd);
+    if (group <= 0) group = init;
+    kill(0, sig);
+    if (tcgetpgrp(tty_fd) == getpgrp()) give_terminal(group);
+    killpg(group, SIGCONT);
+}
+
+/* In sand: wait for init, relaying stops of the command meanwhile. */
+static int wait_for_init(pid_t init)
+{
+    struct pollfd fds[2];
+    int status;
+    pid_t pid;
+    char sig;
+
+    fds[0].fd = stop_pipe[0];
+    fds[0].events = POLLIN;
+    fds[1].fd = syscall(SYS_pidfd_open, init, 0);
+    fds[1].events = POLLIN;
+    if (fds[1].fd < 0) die("pidfd_open");
+    for (;;) {
+        fds[0].revents = 0;
+        fds[1].revents = 0;
+        if (poll(fds, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            die("poll");
+        }
+        if (fds[0].revents & POLLIN) {
+            if (read(stop_pipe[0], &sig, 1) == 1) relay_stop(sig, init);
+            else fds[0].fd = -1;
+        }
+        if (fds[1].revents & POLLIN) break;
+    }
+    for (;;) {
+        pid = waitpid(init, &status, 0);
+        if (pid < 0) {
+            if (errno == EINTR) continue;
+            die("waitpid");
+        }
+        return status;
+    }
 }
 
 static int exit_status(int status)
@@ -798,16 +909,20 @@ static void handle_request(int listener)
 static int supervise(int listener, pid_t child)
 {
     struct pollfd fds[2];
-    int child_fd;
+    struct signalfd_siginfo info;
+    sigset_t chld;
     int status;
     pid_t pid;
 
-    child_fd = syscall(SYS_pidfd_open, child, 0);
-    if (child_fd < 0) die("pidfd_open");
+    /* SIGCHLD is blocked since before the fork, so the signalfd sees
+     * every exit and stop of the command. */
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
     fds[0].fd = listener;
     fds[0].events = POLLIN;
-    fds[1].fd = child_fd;
+    fds[1].fd = signalfd(-1, &chld, SFD_CLOEXEC);
     fds[1].events = POLLIN;
+    if (fds[1].fd < 0) die("signalfd");
 
     for (;;) {
         fds[0].revents = 0;
@@ -817,10 +932,15 @@ static int supervise(int listener, pid_t child)
             die("poll");
         }
         if (fds[0].revents & POLLIN) handle_request(listener);
+        if (fds[1].revents & POLLIN) {
+            if (read(fds[1].fd, &info, sizeof(info)) < 0) die("read signalfd");
+        }
         for (;;) {
-            pid = waitpid(-1, &status, WNOHANG);
+            pid = waitpid(-1, &status, WNOHANG | WUNTRACED);
             if (pid <= 0) break;
-            if (pid == child) return status;
+            if (pid != child) continue;
+            if (WIFSTOPPED(status)) report_stop(status);
+            else return status;
         }
     }
 }
@@ -849,6 +969,7 @@ static void run_command(void)
     int i;
     int listener;
     char ack;
+    sigset_t chld;
 
     for (name = kept_env; *name != NULL; name++) {
         value = getenv(*name);
@@ -863,6 +984,11 @@ static void run_command(void)
     env[n] = "SAND=1";
     n++;
     env[n] = NULL;
+
+    /* Blocked in init for its signalfd; the mask survives exec. */
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    sigprocmask(SIG_UNBLOCK, &chld, NULL);
 
     if (rule_count > 0) {
         /* Tell init the listener's fd number, wait until it has taken a
@@ -914,6 +1040,18 @@ static int run_init(const char *cwd)
     int number;
     int pidfd;
     int listener = -1;
+    sigset_t chld;
+
+    /* Own process group, holding the terminal: see the terminal note at
+     * the top. Done before the command exists so it inherits the group. */
+    if (tty_fd >= 0) {
+        if (setpgid(0, 0) < 0) die("setpgid");
+        if (give_terminal(getpid()) < 0) die("tcsetpgrp");
+        close(stop_pipe[0]);
+    }
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &chld, NULL);
 
     /* Opened here, inside the new mount namespace: the kernel refuses to
      * bind from an fd that belongs to another namespace. */
@@ -956,12 +1094,14 @@ static int run_init(const char *cwd)
     if (listener >= 0) return exit_status(supervise(listener, child));
 
     for (;;) {
-        pid = wait(&status);
+        pid = waitpid(-1, &status, WUNTRACED);
         if (pid < 0) {
             if (errno == EINTR) continue;
             die("wait");
         }
-        if (pid == child) break;
+        if (pid != child) continue;
+        if (WIFSTOPPED(status)) report_stop(status);
+        else break;
     }
     return exit_status(status);
 }
@@ -1412,6 +1552,10 @@ int main(int argc, char **argv)
     }
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) die("no_new_privs");
+    find_terminal();
+    if (tty_fd >= 0) {
+        if (pipe2(stop_pipe, O_CLOEXEC) < 0) die("pipe");
+    }
     enter_namespaces();
 
     /* unshare(CLONE_NEWPID) only applies to children: fork to get pid 1. */
@@ -1422,6 +1566,12 @@ int main(int argc, char **argv)
     forward_to = init;
     install_signal_handlers();
 
+    if (tty_fd >= 0) {
+        close(stop_pipe[1]);
+        status = wait_for_init(init);
+        give_terminal(tty_pgrp);
+        return exit_status(status);
+    }
     for (;;) {
         pid = waitpid(init, &status, 0);
         if (pid < 0) {

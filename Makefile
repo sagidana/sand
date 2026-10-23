@@ -14,15 +14,10 @@ install: sand
 uninstall:
 	$(RM) $(BINDIR)/sand $(COMPDIR)/sand
 
-# Copy the example profiles to ~/.config/sand, keeping any that exist.
-install-profiles:
-	mkdir -p $${XDG_CONFIG_HOME:-$$HOME/.config}/sand
-	cp -n profiles/* $${XDG_CONFIG_HOME:-$$HOME/.config}/sand/
-
 test: sand
 	./test.sh
 
 clean:
 	$(RM) sand
 
-.PHONY: install install-profiles uninstall clean test
+.PHONY: install uninstall clean test

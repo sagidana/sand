@@ -5,7 +5,8 @@
 #     make test          or     ./test.sh [NAME...]
 #
 # With names only matching tests run. Needs bash, python3 for the
-# network cases (skipped otherwise), and unprivileged user namespaces.
+# listener and terminal cases (skipped otherwise), and unprivileged
+# user namespaces.
 
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -161,8 +162,6 @@ expect "--net none has only loopback" 0 "lo" \
     sh -c 'cut -d: -f1 /proc/net/dev | tail -n +3 | tr -d " "'
 expect "loopback is up" 0 "refused" \
     bash -c '{ exec 3<>/dev/tcp/127.0.0.1/1; } 2>&1 | grep -q refused && echo refused'
-expect "rules need --net host" 1 "*need --net host*" \
-    --allow :53 true
 
 LISTENER=
 PORT=
@@ -189,44 +188,8 @@ if [ -n "${PORT:-}" ]; then
     connect="exec 3<>/dev/tcp/127.0.0.1/$PORT && echo connected"
     expect "--net host reaches a local port" 0 "connected" \
         --net host bash -c "$connect"
-    expect "--block all blocks connect" 1 "*blocked connection to 127.0.0.1 port $PORT*unreachable*" \
-        --net host --block all bash -c "$connect"
-    expect "--allow one port lets it through" 0 "connected" \
-        --net host --allow 127.0.0.1:$PORT bash -c "$connect"
-    expect "--allow elsewhere blocks the rest" 1 "*unreachable*" \
-        --net host --allow :1 bash -c "$connect"
-    expect "later rule wins" 0 "connected" \
-        --net host --block all --allow :$PORT bash -c "$connect"
-    # A blocking send into a peer that never reads hangs in the broker;
-    # a second socket must still be served meanwhile.
-    cat > "$T/stall.py" <<'PY'
-import socket, sys
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
-s.connect(("127.0.0.1", int(sys.argv[1])))
-while True:
-    s.sendmsg([b"x" * 65536])
-PY
-    expect "a blocking send does not stall the broker" 0 "connected" \
-        --net host --block :1 --ro "$T/stall.py" bash -c "python3 $T/stall.py $PORT & sleep 1; timeout 5 bash -c '$connect'; kill \$!"
-    expect "src: rule blocks bind" 1 "*ermission*" \
-        --net host --block src:all python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0))'
-    expect "src: rule blocks listen on an unbound socket" 1 "*blocked bind to 0.0.0.0 port 0*ermission*" \
-        --net host --block src:all python3 -c 'import socket; s=socket.socket(); s.listen()'
-    expect "src: allow elsewhere blocks an unbound listen" 1 "*ermission*" \
-        --net host --allow src:127.0.0.1 python3 -c 'import socket; s=socket.socket(); s.listen()'
-    expect "listen on an allowed bound socket passes" 0 "ok" \
-        --net host --allow src:127.0.0.1 python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(); print("ok")'
-    expect "0.0.0.0 as a destination counts as loopback" 1 "*blocked connection to 0.0.0.0*unreachable*" \
-        --net host --block 127.0.0.0/8 bash -c "exec 3<>/dev/tcp/0.0.0.0/$PORT"
-    expect "0.0.0.0 passes when loopback is allowed" 0 "connected" \
-        --net host --allow 127.0.0.1:$PORT bash -c "exec 3<>/dev/tcp/0.0.0.0/$PORT && echo connected"
-    expect "filtered inside filtered is refused" 1 "*cannot be used inside*" \
-        --net host --block all --ro "$SAND" "$SAND" --net host --block all true
-    expect "unfiltered inside filtered keeps outer rules" 1 "*unreachable*" \
-        --net host --block all --ro "$SAND" "$SAND" --net host bash -c "$connect"
 else
-    skipped "network rule cases" "python3 not found"
+    skipped "network host case" "python3 not found"
 fi
 
 # --- nesting ----------------------------------------------------------
@@ -337,9 +300,6 @@ if command -v python3 >/dev/null; then
     tty_case "tty: ctrl-z stops the job, fg resumes it, ctrl-c ends it" \
         ">$SAND -- sleep 100" "^Z" "<Stopped" ">jobs" "<sleep 100" \
         ">fg" "<sleep 100" "^C" ">echo rc=\$?" "<rc=130"
-    tty_case "tty: ctrl-z and fg with network rules" \
-        ">$SAND --net host --block all -- sleep 100" "^Z" "<Stopped" \
-        ">fg" "<sleep 100" "^C" ">echo rc=\$?" "<rc=130"
     tty_case "tty: bg continues the job without the terminal" \
         ">$SAND -- sleep 100" "^Z" "<Stopped" ">bg" "<sleep 100" ">jobs" "<Running" \
         ">kill %1; wait %1; echo rc=\$?" "<rc=143"
@@ -358,8 +318,8 @@ fi
 
 # --- profiles ---------------------------------------------------------
 
-profile net "# comment" "net host" "allow :53" "" "allow :443"
-profile lan "profile net" "allow 10.0.0.0/8"
+profile net "# comment" "net host" "" "env NET=1"
+profile lan "profile net" "env LAN=1"
 profile dev "profile lan" "--rw ." "env FOO=bar" "ro ~"
 profile loop1 "profile loop2"
 profile loop2 "profile loop1"

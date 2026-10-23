@@ -6,7 +6,7 @@ restrictions. One C file, Linux only, no root, no dependencies.
     sand                                   shell in the cwd, read-only, no network
     sand python script.py                  run a command instead of a shell
     sand --rw out make                     one writable directory
-    sand --net host --allow :443 curl https://example.com
+    sand --net host curl https://example.com
     sand -p dev make                       flags written once, in ~/.config/sand/dev
 
 The sandbox is built from Linux namespaces: the command gets its own
@@ -66,8 +66,6 @@ sandbox and everything in it ends with it.
     --env NAME           pass the host's NAME through to the command
     --env NAME=VALUE     set NAME for the command
     --net none|host      loopback only (default), or the host's network
-    --allow RULE         with --net host: allow matching traffic
-    --block RULE         with --net host: block matching traffic
     COMMAND [ARG]...     run COMMAND instead of $SHELL
 
 The first word that is not a flag starts the command. A command whose
@@ -76,7 +74,6 @@ name begins with `-` needs `--` in front of it.
 Path flags take files or directories and may repeat. They apply in
 order and a later flag wins, so `--rw .` makes the cwd writable and
 `--ro ~ --hide ~/.ssh` shows the home directory without the keys.
-`--net none` after network rules drops them.
 
 ## Profiles
 
@@ -86,24 +83,19 @@ command line with or without the dashes. `#` starts a comment and `~`
 at the start of a path means the home directory. `profile NAME` loads
 another profile in place, which is how a hierarchy is built:
 
-    # ~/.config/sand/net        dns and https, nothing else
-    net host
-    allow :53
-    allow :443
-
-    # ~/.config/sand/lan        the same, plus the local network
-    profile net
-    allow 10.0.0.0/8
-    allow 192.168.0.0/16
+    # ~/.config/sand/home       the home directory, minus the keys
+    ro ~
+    hide ~/.ssh
+    hide ~/.gnupg
 
     # ~/.config/sand/dev        a working setup for this machine
-    profile lan
+    profile home
+    net host
     rw .
-    ro ~/.cache/pip
     env SSH_AUTH_SOCK
 
     sand -p dev make
-    sand -p lan -p build ./run.sh
+    sand -p home -p build ./run.sh
     sand -p dev --net none make test      flags after the profile override it
 
 Profiles hold only flags, never a command. Everything is applied in
@@ -117,66 +109,19 @@ with different dotfiles.
 The `profiles/` directory holds a few to start from; copy the ones
 you want to `~/.config/sand`:
 
-    net      host network, but only name lookup and https
-    lan      like net, plus the private address ranges
-    online   the host's network, unfiltered
+    online   the host's network
     rw       the current directory is writable
     home     the home directory read-only, minus keys and credentials
 
 The command's exit status is returned. A command that cannot be found
 gives 127, one that cannot be executed gives 126, like a shell.
 
-## Network rules
-
-`--net host` gives the command the host's network as is. Adding
-`--allow` or `--block` rules filters it by address and port:
-
-    RULE = [src:][ADDR[/PREFIX]][:PORT[-PORT]] | all
-
-    1.1.1.1              one address, any port
-    10.0.0.0/8:443       a range, one port
-    :53                  any address, one port
-    8000-9000            any address, a port range
-    [::1]:80             IPv6 with a port needs brackets
-    src:8080             a local port, applies to bind
-
-Rules apply in order and a later rule wins. As soon as any `--allow`
-is given, everything not allowed is blocked. Destination rules apply
-to `connect` and to UDP sends that carry an address; `0.0.0.0` and `::`
-as a destination mean this host and are matched as `127.0.0.1` and
-`::1`. `src:` rules apply to `bind`, which covers listening sockets
-and explicit source ports, and to `listen` on a socket that was never
-bound, which would otherwise take a port of its own: that counts as a
-bind to port 0 on every address. A blocked call fails with "Network is
-unreachable" (EACCES for bind and listen)
-and a line on stderr names the address, which helps when wrapping a
-program whose network needs are not documented.
-
-    sand --net host --allow :53 --allow :443 pip install requests
-    sand --net host --block :25 ./app
-    sand --net host --allow 10.0.0.0/8 --block 10.1.0.0/16 ./app
-
-How it works: the command runs under a seccomp filter that hands
-`connect`, `bind`, `listen`, `sendmsg`, `sendmmsg` and address-carrying
-`sendto` to the sandbox's init process. Init takes a handle on the command's
-socket, copies the address out of the command's memory, checks the
-rules and performs the call itself. Because the kernel never re-reads
-the command's memory, a thread changing the address after the check
-gains nothing. Plain `send`, `write` and all receives are not trapped.
-A call that may block, such as `connect` on a blocking socket, is
-performed by a short-lived child of init, so a hung peer does not hold
-up the other sockets.
-
-The kernel allows one such filter per process chain, so a filtered
-sandbox cannot run inside another filtered sandbox. The inner one
-refuses with a message; an unfiltered inner sandbox still runs under
-the outer rules.
-
 ## Nesting
 
 `sand` inside `sand` works, as long as the binary is visible
 inside (it is if it is installed under `/usr`, or pass `--ro` for it).
-Each level can only restrict further. The inner `sand` only sees
+Each level can only restrict further: `--net host` inside a `--net
+none` sandbox is that empty network. The inner `sand` only sees
 profiles if `~/.config/sand` is passed in with `--ro`.
 
 ## Tests
@@ -184,7 +129,7 @@ profiles if `~/.config/sand` is passed in with `--ro`.
     make test                    # or ./test.sh [NAME...]
 
 `test.sh` runs the built binary on small cases and prints one line per
-case. The network cases need `python3` for a local listener.
+case. The listener and terminal cases need `python3`.
 
 ## Not covered
 
@@ -197,14 +142,10 @@ grow. There is no wall-clock timeout either; use `timeout(1)` in front.
 Real limits need cgroups, which an unprivileged process only gets when
 the system delegates a cgroup to it.
 
-Domain-based network rules. Rules match addresses, not names. Filtering
-by domain needs a resolver inside the sandbox that only answers allowed
-names and feeds the resulting addresses into the rules.
-
-Inbound traffic. With `--net host`, `src:` rules decide which ports a
-program may listen on, but anyone who can reach the host can connect
-to a permitted port. There is no filtering by peer address on accept
-or on UDP receive.
+Network filtering. The network is either absent or the host's as is;
+there is no rule by address, port or name. The plan is a separate
+step that creates named network namespaces with their own rules once,
+with root, which a profile then joins without it.
 
 Root inside. The command runs as your own user, not as root in a user
 namespace. `apt install`, `chown` to another user, `mknod`, mounting
@@ -237,7 +178,7 @@ A security boundary against the kernel. The sandbox is a policy tool
 built on unprivileged user namespaces, which are themselves a kernel
 attack surface. It keeps honest programs from touching what they
 should not and makes mistakes harmless. It is not a defense against a
-kernel exploit, and there is no general seccomp syscall allowlist.
+kernel exploit, and there is no seccomp syscall allowlist.
 
-Linux only. Namespaces, seccomp and `pidfd_getfd` are Linux features.
+Linux only. Namespaces are a Linux feature.
 WSL2 works, WSL1 does not.

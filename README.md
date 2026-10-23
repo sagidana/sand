@@ -26,9 +26,10 @@ package picks up from `/usr/local` and from `~/.local`. It completes
 flags, profile names and paths, and after them the command's own
 completion takes over, as it does for `sudo`.
 
-Requires a Linux kernel of 5.6 or newer with unprivileged user
-namespaces enabled (the default on most distributions, and on WSL2),
-x86_64 or aarch64, and a C compiler.
+Requires a Linux kernel of 5.12 or newer (April 2021: Debian 12,
+Ubuntu 22.04, RHEL 9 and later) with unprivileged user namespaces
+enabled (the default on most distributions, and on WSL2), x86_64 or
+aarch64, and a C compiler. It builds with older kernel headers too.
 
 ## What the command sees
 

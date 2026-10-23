@@ -228,6 +228,18 @@ static void make_dirs(const char *path)
     if (mkdir(buf, 0755) < 0 && errno != EEXIST) die("mkdir %s", buf);
 }
 
+/* Syscall numbers that headers older than the kernels they arrived in
+ * lack; the same on every architecture since Linux 5.1. */
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
+#ifndef SYS_mount_setattr
+#define SYS_mount_setattr 442
+#endif
+
 /* Arguments for mount_setattr(2); defined here so the build does not
  * depend on the C library shipping the wrapper. */
 struct mount_attr_args {

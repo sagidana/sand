@@ -10,7 +10,7 @@ _sand()
     local i
     for ((i = 1; i < cword; i++)); do
         case ${words[i]} in
-            -p|--profile|--ro|--rw|--hide|--env|--net)
+            -p|--profile|--ro|--rw|--hide|--env|--net|--allow|--block)
                 ((i++))
                 ;;
             --)
@@ -41,13 +41,16 @@ _sand()
             return
             ;;
         --net)
-            COMPREPLY=($(compgen -W "none host $(ls /var/lib/sand/net 2>/dev/null)" -- "$cur"))
+            COMPREPLY=($(compgen -W 'none host' -- "$cur"))
+            return
+            ;;
+        --allow|--block)
             return
             ;;
     esac
 
     if [[ $cur == -* ]]; then
-        COMPREPLY=($(compgen -W '-p --profile --ro --rw --hide --env --net --' -- "$cur"))
+        COMPREPLY=($(compgen -W '-p --profile --ro --rw --hide --env --net --allow --block --' -- "$cur"))
         return
     fi
     # An empty command word would list every program on PATH, which

@@ -1,0 +1,13 @@
+# AppArmor profile for sand on Ubuntu 23.10 and later, where only
+# profiled programs may create user namespaces. It confines nothing
+# else: sand runs unconfined apart from being allowed user namespaces.
+#
+#     sudo make install-apparmor
+#
+# The path must match where sand is installed.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile sand /usr/local/bin/sand flags=(unconfined) {
+  userns,
+}

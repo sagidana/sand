@@ -7,7 +7,7 @@ restrictions. One C file, Linux only, no root, no dependencies.
     sand python script.py                  run a command instead of a shell
     sand --rw out make                     one writable directory
     sand --net host curl https://example.com
-    sand --net work make                   a network built once by sand-net
+    sand --net host --allow :443 curl https://example.com
     sand -p dev make                       flags written once, in ~/.config/sand/dev
 
 The sandbox is built from Linux namespaces: the command gets its own
@@ -18,7 +18,7 @@ root. Sandboxes nest.
 ## Build and install
 
     make
-    make install                 # /usr/local/bin/sand and sand-net
+    make install                 # /usr/local/bin/sand
     make install PREFIX=~/.local # anywhere else
 
 `make install` also puts a bash completion file under
@@ -31,6 +31,17 @@ Requires a Linux kernel of 5.12 or newer (April 2021: Debian 12,
 Ubuntu 22.04, RHEL 9 and later) with unprivileged user namespaces
 enabled (the default on most distributions, and on WSL2), x86_64 or
 aarch64, and a C compiler. It builds with older kernel headers too.
+
+Ubuntu 23.10 and later let only programs with an AppArmor profile
+create user namespaces (`kernel.apparmor_restrict_unprivileged_userns`),
+and `sand` without one stops at "unshare: Operation not permitted"
+with a line saying so. `apparmor/sand` is that profile, for `sand`
+at `/usr/local/bin`; edit the path for another `PREFIX`, then
+
+    sudo make install-apparmor
+
+On the few systems with the older `kernel.unprivileged_userns_clone`
+switched off, `sand` names that sysctl instead.
 
 ## What the command sees
 
@@ -58,6 +69,13 @@ Without a terminal, `SIGINT`, `SIGQUIT`, `SIGTERM` and `SIGHUP` sent to
 `sand` are passed to the command. If `sand` itself is killed, the
 sandbox and everything in it ends with it.
 
+Inside, pid 1 is `sand`'s own init, which starts the command and reaps
+for it. The command runs one user namespace below init, mapped to the
+same uid, so it holds no capability over init, the mounts or the
+network: it cannot ptrace init or read its memory, undo a mount, or
+change an interface. It can still make namespaces of its own, which is
+what nesting uses.
+
 ## Flags
 
     -p, --profile NAME   load the flags written in ~/.config/sand/NAME
@@ -66,8 +84,9 @@ sandbox and everything in it ends with it.
     --hide PATH          make a visible PATH appear empty
     --env NAME           pass the host's NAME through to the command
     --env NAME=VALUE     set NAME for the command
-    --net none|host|NAME loopback only (default), the host's network,
-                         or a network built by sand-net
+    --net none|host      loopback only (default), or the host's network
+    --allow RULE         with --net host: allow matching traffic
+    --block RULE         with --net host: block matching traffic
     COMMAND [ARG]...     run COMMAND instead of $SHELL
 
 The first word that is not a flag starts the command. A command whose
@@ -76,6 +95,7 @@ name begins with `-` needs `--` in front of it.
 Path flags take files or directories and may repeat. They apply in
 order and a later flag wins, so `--rw .` makes the cwd writable and
 `--ro ~ --hide ~/.ssh` shows the home directory without the keys.
+`--net none` after network rules drops them.
 
 ## Profiles
 
@@ -85,19 +105,24 @@ command line with or without the dashes. `#` starts a comment and `~`
 at the start of a path means the home directory. `profile NAME` loads
 another profile in place, which is how a hierarchy is built:
 
-    # ~/.config/sand/home       the home directory, minus the keys
-    ro ~
-    hide ~/.ssh
-    hide ~/.gnupg
+    # ~/.config/sand/net        dns and https, nothing else
+    net host
+    allow :53
+    allow :443
+
+    # ~/.config/sand/lan        the same, plus the local network
+    profile net
+    allow 10.0.0.0/8
+    allow 192.168.0.0/16
 
     # ~/.config/sand/dev        a working setup for this machine
-    profile home
-    net host
+    profile lan
     rw .
+    ro ~/.cache/pip
     env SSH_AUTH_SOCK
 
     sand -p dev make
-    sand -p home -p build ./run.sh
+    sand -p lan -p build ./run.sh
     sand -p dev --net none make test      flags after the profile override it
 
 Profiles hold only flags, never a command. Everything is applied in
@@ -111,89 +136,86 @@ with different dotfiles.
 The `profiles/` directory holds a few to start from; copy the ones
 you want to `~/.config/sand`:
 
-    online   the host's network
+    net      host network, but only name lookup and https
+    lan      like net, plus the private address ranges
+    online   the host's network, unfiltered
     rw       the current directory is writable
     home     the home directory read-only, minus keys and credentials
 
 The command's exit status is returned. A command that cannot be found
 gives 127, one that cannot be executed gives 126, like a shell.
 
-## Networks
+## Network rules
 
-Between no network and the host's whole network there are named
-networks: a network namespace of its own with a way out through the
-host, built once with root by `sand-net`, and joined by `sand` without
-it.
+`--net host` gives the command the host's network as is. Adding
+`--allow` or `--block` rules filters it by address and port:
 
-    sudo sand-net create work            # for the user running sudo
-    sudo sand-net create pip --allow :443
-    sand --net work curl https://example.com
-    sand-net list
-    sudo sand-net delete work
-
-In a profile that is `net work`. Inside, the command sees `lo` and an
-`eth0` with a private address; the host forwards its traffic out
-through NAT, as a router does. `create` takes `--dns ADDR` to name the
-resolver the network should use; by default it copies the host's,
-or the ones behind the host's local stub resolver. Nothing can reach
-the network from outside.
-
-What `create` builds: a user namespace owned by the user with the
-network namespace inside it, both kept alive by bind mounts under
-`/var/lib/sand/net/NAME`; a veth pair with one end inside and one on
-the host, named `sand-NAME`, on a `/30` from `10.44.0.0/16`;
-forwarding; and one nft table `sand` holding the masquerade and the
-rules for every network. The ownership is what lets `sand` join without root: the
-owner of a user namespace has every capability in it, including the
-one needed to enter the network namespace. The command then runs one
-namespace deeper, with no capability over the network. On a host with
-Docker, which drops forwarded traffic, an accept for the veth goes
-into its `DOCKER-USER` chain.
-
-The namespaces and the host side are kernel state and do not survive a
-reboot; the configuration under `/var/lib/sand/net` does. `sudo
-sand-net up` rebuilds whatever is missing, for one network or all, and
-is safe to run at any time. A line in a boot script or a one-line
-systemd unit makes it automatic. `sand --net NAME` refuses to start
-when the network is down, so a stale namespace never silently means no
-network. If some other tool flushes the firewall or turns forwarding
-off, the networks lose their way out until the next `up`, and never
-gain more than they had.
-
-### Rules
-
-A network can be narrowed to the addresses and ports a job needs:
-
-    sudo sand-net create pip --allow :443
-    sudo sand-net create lan --allow 10.0.0.0/8 --block 10.1.0.0/16
-    sudo sand-net create mail --block :25
-
-    RULE = [ADDR[/PREFIX]][:PORT[-PORT]] | all
+    RULE = [src:][ADDR[/PREFIX]][:PORT[-PORT]] | all
 
     1.1.1.1              one address, any port
     10.0.0.0/8:443       a range, one port
     :53                  any address, one port
     8000-9000            any address, a port range
-    [2001:db8::1]:80     IPv6 with a port needs brackets
+    [::1]:80             IPv6 with a port needs brackets
+    src:8080             a local port, applies to bind
 
 Rules apply in order and a later rule wins. As soon as any `--allow`
-is given, everything not allowed is blocked. A rule with a port covers
-TCP and UDP; one without covers everything, ping included. The
-network's resolvers are always allowed on port 53, so a rule list
-never has to mention DNS. A blocked connection is rejected, so a
-program sees "connection refused" at once rather than a hang.
-Networks cannot reach each other, and the host itself is subject to
-the same rules as the rest of the world.
+is given, everything not allowed is blocked. Destination rules apply
+to `connect` and to UDP sends that carry an address; `0.0.0.0` and `::`
+as a destination mean this host and are matched as `127.0.0.1` and
+`::1`, and IPv4 carried on an IPv6 socket as `::ffff:a.b.c.d` is
+matched as the IPv4 address. `src:` rules apply to `bind`, which
+covers listening sockets and explicit source ports, and to `listen` on
+a socket that was never bound, which would otherwise take a port of
+its own: that counts as a bind to port 0 on every address. A blocked
+call fails with "Network is unreachable" (EACCES for bind and listen)
+and a line on stderr names the address, which helps when wrapping a
+program whose network needs are not documented.
 
-The rules are part of the network, not of the sandbox: they are nft
-rules on the host end of the veth, owned by root, and nothing inside
-can loosen them. `sand-net list` shows them, `sand-net nft` prints the
-whole table as `up` loads it, and to change them delete the network
-and create it again. Rules match addresses, not names; filtering by
-domain is not provided.
+    sand --net host --allow :53 --allow :443 pip install requests
+    sand --net host --block :25 ./app
+    sand --net host --allow 10.0.0.0/8 --block 10.1.0.0/16 ./app
 
-`sand-net` runs `ip` and `nft`, and `iptables` where Docker is
-present.
+How it works: the command runs under a seccomp filter that hands
+`connect`, `bind`, `listen`, `sendmsg`, `sendmmsg` and address-carrying
+`sendto` to the sandbox's init process. Init takes a handle on the
+command's socket, copies the address out of the command's memory,
+checks the rules and performs the call itself. Because the kernel
+never re-reads the command's memory, a thread changing the address
+after the check gains nothing. Plain `send`, `write` and all receives
+are not trapped. A call that may block, such as `connect` on a
+blocking socket, is performed by a short-lived child of init, so a hung
+peer does not hold up the other sockets.
+
+Init is out of the command's reach: the command runs in a user
+namespace below it, where the same uid gives no right to ptrace init,
+read its memory or take its descriptors (and init is non-dumpable
+besides). The filter closes the ways around the trapped calls:
+
+- `io_uring` is absent, since it can connect and send without a
+  syscall the filter sees.
+- `socket` opens only unix, IPv4 and IPv6 stream and datagram sockets
+  with the common protocols (TCP, UDP, UDP-Lite, ICMP, MPTCP), routing
+  netlink, and the kernel's crypto family. SCTP, which connects by
+  `setsockopt`, and every family whose addresses the broker does not
+  read, are refused.
+- A unix socket may use any path the mount namespace shows, but not an
+  abstract name: those live in the network namespace, where with
+  `--net host` every service of the host listens. Connecting to one is
+  refused and binding one is denied.
+- Syscalls of another ABI (32-bit, x32) kill the process rather than
+  being misread.
+
+Side effects of the broker performing the call: a unix peer that reads
+`SO_PEERCRED` sees init's pid, not the command's, and a socket
+received over a unix socket from a host service passed in with `--rw`
+is a connection the rules never saw. Rules match addresses, not names;
+filtering by domain is not provided.
+
+The kernel allows one such filter per process chain, so a filtered
+sandbox cannot run inside another filtered sandbox. The inner one
+refuses with a message; an unfiltered inner sandbox still runs under
+the outer rules.
 
 ## Nesting
 
@@ -221,8 +243,8 @@ grow. There is no wall-clock timeout either; use `timeout(1)` in front.
 Real limits need cgroups, which an unprivileged process only gets when
 the system delegates a cgroup to it.
 
-Domain-based network rules. Rules on a network match addresses, not
-names. Filtering by domain needs a resolver inside the network that
+Domain-based network rules. Rules match addresses, not names.
+Filtering by domain needs a resolver under the sandbox's control that
 only answers allowed names and feeds the addresses into the rules.
 
 Root inside. The command runs as your own user, not as root in a user
@@ -256,7 +278,8 @@ A security boundary against the kernel. The sandbox is a policy tool
 built on unprivileged user namespaces, which are themselves a kernel
 attack surface. It keeps honest programs from touching what they
 should not and makes mistakes harmless. It is not a defense against a
-kernel exploit, and there is no seccomp syscall allowlist.
+kernel exploit, and apart from the network filter there is no seccomp
+syscall allowlist.
 
 Linux only. Namespaces are a Linux feature.
 WSL2 works, WSL1 does not.

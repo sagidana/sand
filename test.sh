@@ -12,10 +12,9 @@ set -u
 cd "$(dirname "$0")" || exit 1
 SAND=${SAND:-$PWD/sand}
 SAND=$(realpath "$SAND") || exit 1
-SANDNET=${SANDNET:-$PWD/sand-net}
 
 T=$(mktemp -d) || exit 1
-trap 'kill $LISTENER $HOLDER 2>/dev/null; rm -rf "$T"' EXIT
+trap 'kill $LISTENER 2>/dev/null; rm -rf "$T"' EXIT
 WORK=$T/work
 mkdir -p "$WORK/sub" "$T/other" "$T/cfg/sand"
 echo hello > "$WORK/file"
@@ -163,6 +162,10 @@ expect "--net none has only loopback" 0 "lo" \
     sh -c 'cut -d: -f1 /proc/net/dev | tail -n +3 | tr -d " "'
 expect "loopback is up" 0 "refused" \
     bash -c '{ exec 3<>/dev/tcp/127.0.0.1/1; } 2>&1 | grep -q refused && echo refused'
+expect "rules need --net host" 1 "*need --net host*" \
+    --allow :53 true
+expect "bad rule" 1 "*bad port: 99999*" \
+    --net host --allow :99999 true
 
 LISTENER=
 PORT=
@@ -189,148 +192,125 @@ if [ -n "${PORT:-}" ]; then
     connect="exec 3<>/dev/tcp/127.0.0.1/$PORT && echo connected"
     expect "--net host reaches a local port" 0 "connected" \
         --net host bash -c "$connect"
-else
-    skipped "network host case" "python3 not found"
-fi
-
-# --- named networks ---------------------------------------------------
-# sand-net needs root and ip/nft to build one; what can be tested here
-# is the join: a holder process makes a user namespace it owns with a
-# network namespace inside, listening on a port there, and a directory
-# points at its namespace files the way /var/lib/sand/net/NAME would.
-
-HOLDER=
-NPORT=
-if command -v python3 >/dev/null; then
-    python3 - "$T/holder" <<'PY' &
-import ctypes, fcntl, os, socket, struct, sys
-libc = ctypes.CDLL(None, use_errno=True)
-uid, gid = os.getuid(), os.getgid()
-if libc.unshare(0x10000000) != 0:
-    sys.exit("unshare user: " + os.strerror(ctypes.get_errno()))
-open("/proc/self/setgroups", "w").write("deny")
-open("/proc/self/gid_map", "w").write("%d %d 1" % (gid, gid))
-open("/proc/self/uid_map", "w").write("%d %d 1" % (uid, uid))
-if libc.unshare(0x40000000) != 0:
-    sys.exit("unshare net: " + os.strerror(ctypes.get_errno()))
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-flags = struct.unpack("16sH14s", fcntl.ioctl(s, 0x8913, struct.pack("16sH14s", b"lo", 0, b"")))[1]
-fcntl.ioctl(s, 0x8914, struct.pack("16sH14s", b"lo", flags | 1, b""))
-l = socket.socket()
-l.bind(("127.0.0.1", 0))
-l.listen()
-open(sys.argv[1], "w").write("%d %d" % (os.getpid(), l.getsockname()[1]))
+    expect "--block all blocks connect" 1 "*blocked connection to 127.0.0.1 port $PORT*unreachable*" \
+        --net host --block all bash -c "$connect"
+    expect "--allow one port lets it through" 0 "connected" \
+        --net host --allow 127.0.0.1:$PORT bash -c "$connect"
+    expect "--allow elsewhere blocks the rest" 1 "*unreachable*" \
+        --net host --allow :1 bash -c "$connect"
+    expect "later rule wins" 0 "connected" \
+        --net host --block all --allow :$PORT bash -c "$connect"
+    # A blocking send into a peer that never reads hangs in the broker;
+    # a second socket must still be served meanwhile.
+    cat > "$T/stall.py" <<'PY'
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+s.connect(("127.0.0.1", int(sys.argv[1])))
 while True:
-    c, _ = l.accept()
-    c.send(b"inside\n")
-    c.close()
+    s.sendmsg([b"x" * 65536])
 PY
-    HOLDER=$!
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        [ -s "$T/holder" ] && break
-        sleep 0.2
-    done
-    read -r HPID NPORT < "$T/holder" 2>/dev/null
-fi
-if [ -n "${NPORT:-}" ]; then
-    mkdir -p "$T/netA" "$T/stale"
-    ln -s "/proc/$HPID/ns/user" "$T/netA/user"
-    ln -s "/proc/$HPID/ns/net" "$T/netA/net"
-    echo "nameserver 10.44.1.1" > "$T/netA/resolv.conf"
-    touch "$T/stale/user" "$T/stale/net"
-    inside="exec 3<>/dev/tcp/127.0.0.1/$NPORT && head -1 <&3"
-    expect "--net DIR joins the network" 0 "inside" \
-        --net "$T/netA" bash -c "$inside"
-    expect "a joined network has no capabilities" 0 "CapEff:*0000000000000000" \
-        --net "$T/netA" grep CapEff /proc/self/status
-    expect "a joined network brings its resolv.conf" 0 "nameserver 10.44.1.1" \
-        --net "$T/netA" cat /etc/resolv.conf
-    expect "net DIR in a profile" 0 "inside" \
-        --ro "$T/netA" --net "$T/netA" bash -c "$inside"
-    profile joined "net $T/netA"
-    expect "net in a profile joins" 0 "inside" \
-        -p joined bash -c "$inside"
-    expect "--net none after a network is empty again" 1 "*refused*" \
-        -p joined --net none bash -c "$inside"
-    expect "a stale network is refused" 1 "*not a namespace*sand-net up*" \
-        --net "$T/stale" true
-    expect "--net NAME looks under /var/lib/sand/net" 1 "*/var/lib/sand/net/nosuch/user*" \
-        --net nosuch true
+    expect "a blocking send does not stall the broker" 0 "connected" \
+        --net host --block :1 --ro "$T/stall.py" bash -c "python3 $T/stall.py $PORT & sleep 1; timeout 5 bash -c '$connect'; kill \$!"
+    expect "src: rule blocks bind" 1 "*ermission*" \
+        --net host --block src:all python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0))'
+    expect "src: rule blocks listen on an unbound socket" 1 "*blocked bind to 0.0.0.0 port 0*ermission*" \
+        --net host --block src:all python3 -c 'import socket; s=socket.socket(); s.listen()'
+    expect "src: allow elsewhere blocks an unbound listen" 1 "*ermission*" \
+        --net host --allow src:127.0.0.1 python3 -c 'import socket; s=socket.socket(); s.listen()'
+    expect "listen on an allowed bound socket passes" 0 "ok" \
+        --net host --allow src:127.0.0.1 python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(); print("ok")'
+    expect "0.0.0.0 as a destination counts as loopback" 1 "*blocked connection to 0.0.0.0*unreachable*" \
+        --net host --block 127.0.0.0/8 bash -c "exec 3<>/dev/tcp/0.0.0.0/$PORT"
+    expect "0.0.0.0 passes when loopback is allowed" 0 "connected" \
+        --net host --allow 127.0.0.1:$PORT bash -c "exec 3<>/dev/tcp/0.0.0.0/$PORT && echo connected"
+    expect "IPv4 mapped in IPv6 is judged as IPv4" 1 "*blocked connection to 127.0.0.1 port $PORT*unreachable*" \
+        --net host --block 127.0.0.0/8 python3 -c "import socket; s=socket.socket(socket.AF_INET6); s.connect(('::ffff:127.0.0.1', $PORT))"
+    expect "udp sendto is judged" 1 "*blocked connection to 127.0.0.1 port 9*unreachable*" \
+        --net host --allow :$PORT python3 -c 'import socket; u=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.sendto(b"x", ("127.0.0.1", 9))'
+    expect "udp sendto to an allowed port passes" 0 "1" \
+        --net host --allow :$PORT python3 -c "import socket; u=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); print(u.sendto(b'x', ('127.0.0.1', $PORT)))"
+    expect "sendmsg on a connected tcp socket passes" 0 "3" \
+        --net host --allow :$PORT python3 -c "import socket; t=socket.socket(); t.connect(('127.0.0.1', $PORT)); print(t.sendmsg([b'abc']))"
+    expect "filtered inside filtered is refused" 1 "*cannot be used inside*" \
+        --net host --block all --ro "$SAND" "$SAND" --net host --block all true
+    expect "unfiltered inside filtered keeps outer rules" 1 "*unreachable*" \
+        --net host --block all --ro "$SAND" "$SAND" --net host bash -c "$connect"
+    profile pinned "net host" "allow 127.0.0.1:$PORT"
+    expect "rules in a profile" 0 "connected" \
+        -p pinned bash -c "$connect"
+    expect "--net none after rules drops them" 1 "*refused*" \
+        -p pinned --net none bash -c "$connect"
+
+    # What the filter closes besides addresses.
+    expect "io_uring is absent" 0 "Function not implemented" \
+        --net host --block :1 python3 -c 'import ctypes, os; l = ctypes.CDLL(None, use_errno=True); l.syscall(425, 8, ctypes.c_void_p(0)); print(os.strerror(ctypes.get_errno()))'
+    expect "unknown socket families are refused" 0 "vsock:Address family not supported by protocol sctp:Protocol not supported seqpacket:Socket type not supported raw:Socket type not supported netlink-generic:Protocol not supported socketpair-netlink:Address family not supported by protocol" \
+        --net host --block :1 python3 -c '
+import socket
+out = []
+for name, args in [("vsock", (40, 1, 0)), ("sctp", (2, 1, 132)), ("seqpacket", (2, 5, 0)), ("raw", (2, 3, 1)), ("netlink-generic", (16, 3, 16))]:
+    try:
+        socket.socket(*args)
+        out.append(name + ":ok")
+    except OSError as e:
+        out.append(name + ":" + e.strerror)
+try:
+    socket.socketpair(16)
+    out.append("socketpair-netlink:ok")
+except OSError as e:
+    out.append("socketpair-netlink:" + e.strerror)
+print(" ".join(out))'
+    expect "the usual sockets still open" 0 "ok" \
+        --net host --block :1 python3 -c '
+import socket
+for a in [(1, 1, 0), (1, 2, 0), (2, 1, 0), (2, 2, 0), (10, 1, 0), (10, 2, 0), (16, 3, 0)]:
+    socket.socket(*a)
+try:
+    socket.socket(2, 2, 1)
+except PermissionError:
+    pass                            # icmp needs the gid in net.ipv4.ping_group_range
+socket.socketpair()
+print("ok")'
+    expect "abstract unix sockets are blocked" 1 "*blocked connection to abstract socket @nowhere*refused*" \
+        --net host --block :1 python3 -c 'import socket; s = socket.socket(socket.AF_UNIX); s.connect(b"\0nowhere")'
+    expect "abstract unix bind is blocked" 1 "*blocked bind to abstract socket @sand-test*ermission*" \
+        --net host --block :1 python3 -c 'import socket; s = socket.socket(socket.AF_UNIX); s.bind(b"\0sand-test")'
+    expect "unix paths work, relative to the command, with fd passing" 0 "b'hi' b'via-fd' b'stream' b'conn' 600" \
+        --net host --rw . --block :1 python3 -c '
+import socket, os, array
+os.umask(0o177)
+srv = socket.socket(socket.AF_UNIX); srv.bind("rel.sock"); srv.listen()
+c = socket.socket(socket.AF_UNIX); c.connect("rel.sock"); a, _ = srv.accept()
+d = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); d.bind("dg.sock")
+e = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+r, w = os.pipe()
+e.sendmsg([b"hi"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [w]))], 0, "dg.sock")
+msg, anc, fl, ad = d.recvmsg(10, socket.CMSG_SPACE(4))
+fd = array.array("i"); fd.frombytes(anc[0][2]); os.write(fd[0], b"via-fd"); got = os.read(r, 6)
+c.sendmsg([b"stream"]); s = a.recv(6)
+e.connect("dg.sock"); e.sendmsg([b"conn"]); k = d.recv(4)
+mode = oct(os.stat("dg.sock").st_mode)[-3:]
+os.unlink("rel.sock"); os.unlink("dg.sock")
+print(msg, got, s, k, mode)'
+    expect "fd passing to an ip socket is refused" 1 "*not supported*" \
+        --net host --allow :$PORT python3 -c "import socket, array; t=socket.socket(); t.connect(('127.0.0.1', $PORT)); t.sendmsg([b'x'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [0]))])"
 else
-    skipped "named network cases" "python3 not found"
+    skipped "network rule cases" "python3 not found"
 fi
 
-expect "sand-net list without state" 0 "" \
-    --ro "$SANDNET" "$SANDNET" list
-expect "sand-net create needs root" 1 "*needs root*" \
-    --ro "$SANDNET" "$SANDNET" create x
-expect "sand-net without a command gives usage" 2 "usage:*" \
-    --ro "$SANDNET" "$SANDNET"
+# --- the command below init --------------------------------------------
 
-# Rules become the nft table; sand-net nft prints it from the configs,
-# which the tests write by hand under their own state directory.
-mkdir -p "$T/state/work" "$T/state/open" "$T/badstate/bad" "$T/nostate"
-printf 'owner %d\nindex 1\ndns 1.1.1.1\ndns 2606:4700::1111\nallow :443\nblock 10.0.0.0/8\nallow [2001:db8::1]:53\nallow 192.168.1.0/24:8000-9000\n' "$(id -u)" > "$T/state/work/config"
-printf 'owner %d\nindex 2\ndns 9.9.9.9\nblock :25\n' "$(id -u)" > "$T/state/open/config"
-printf 'owner %d\nindex 1\nallow 1.2.3.4:99999\n' "$(id -u)" > "$T/badstate/bad/config"
-cat > "$T/nft.expected" <<'NFT'
-add table inet sand
-flush table inet sand
-table inet sand {
-    chain forward {
-        type filter hook forward priority 0; policy accept;
-        ct state established,related accept
-        iifname "sand-*" oifname "sand-*" reject
-        iifname "sand-open" jump net_open
-        iifname "sand-work" jump net_work
-    }
-    chain input {
-        type filter hook input priority 0; policy accept;
-        ct state established,related accept
-        iifname "sand-open" jump net_open
-        iifname "sand-work" jump net_work
-    }
-    chain net_open {
-        ip daddr 9.9.9.9 meta l4proto { tcp, udp } th dport 53 accept
-        meta l4proto { tcp, udp } th dport 25 reject
-        accept
-    }
-    chain net_work {
-        ip daddr 1.1.1.1 meta l4proto { tcp, udp } th dport 53 accept
-        ip6 daddr 2606:4700::1111 meta l4proto { tcp, udp } th dport 53 accept
-        ip daddr 192.168.1.0/24 meta l4proto { tcp, udp } th dport 8000-9000 accept
-        ip6 daddr 2001:db8::1/128 meta l4proto { tcp, udp } th dport 53 accept
-        ip daddr 10.0.0.0/8 reject
-        meta l4proto { tcp, udp } th dport 443 accept
-        reject
-    }
-    chain postrouting {
-        type nat hook postrouting priority 100; policy accept;
-        ip saddr 10.44.2.0/30 oifname != "sand-open" masquerade
-        ip saddr 10.44.1.0/30 oifname != "sand-work" masquerade
-    }
-}
-NFT
-if selected "sand-net nft translates the rules"; then
-    run --ro "$SANDNET" --ro "$T/state" --env "SAND_NET_STATE=$T/state" "$SANDNET" nft
-    if [ "$status" = 0 ] && [ "$out" = "$(cat "$T/nft.expected")" ]; then
-        ok "sand-net nft translates the rules"
-    else
-        bad "sand-net nft translates the rules" "exit $status; output: $out"
-    fi
+expect "the command cannot read init" 1 "*ermission denied*" \
+    cat /proc/1/environ
+expect "the command cannot mount" 1 "*superuser*" \
+    sh -c 'mount -t tmpfs none /tmp 2>&1 || exit 1'
+expect "the command maps its own uid" 0 "*$(id -u)*$(id -u)*1" \
+    cat /proc/self/uid_map
+if command -v python3 >/dev/null; then
+    expect "the command cannot take init's descriptors" 0 "Operation not permitted" \
+        --net host --block :1 python3 -c 'import os, ctypes; l = ctypes.CDLL(None, use_errno=True); l.syscall(438, os.pidfd_open(1), 3, 0); print(os.strerror(ctypes.get_errno()))'
 fi
-expect "sand-net nft without networks prints nothing" 0 "" \
-    --ro "$SANDNET" --ro "$T/nostate" --env "SAND_NET_STATE=$T/nostate" "$SANDNET" nft
-expect "sand-net refuses a bad rule in a config" 1 "*bad port: 99999*" \
-    --ro "$SANDNET" --ro "$T/badstate" --env "SAND_NET_STATE=$T/badstate" "$SANDNET" nft
-expect "sand-net list shows the rules" 0 "open*down*10.44.2.0/30*
-*block :25
-work*down*10.44.1.0/30*
-*allow :443
-*block 10.0.0.0/8
-*allow ?2001:db8::1?:53
-*allow 192.168.1.0/24:8000-9000" \
-    --ro "$SANDNET" --ro "$T/state" --env "SAND_NET_STATE=$T/state" "$SANDNET" list
 
 # --- nesting ----------------------------------------------------------
 
@@ -353,6 +333,8 @@ pid, fd = pty.fork()
 if pid == 0:
     os.environ["PS1"] = "P> "
     os.environ["TERM"] = "dumb"
+    for name in ("PROMPT_COMMAND", "BASH_ENV", "ENV"):
+        os.environ.pop(name, None)
     os.execvp("bash", ["bash", "--norc", "--noprofile", "-i"])
 
 out = b""
@@ -448,7 +430,7 @@ if command -v python3 >/dev/null; then
         ">kill %1; wait %1; echo rc=\$?" "<rc=143"
     tty_case "tty: background job reading the terminal stops, fg feeds it" \
         ">$SAND -- sh -c 'read x; echo got:\$x' &" ">echo outer-alive" "<outer-alive" \
-        ">wait" "<Stopped" ">fg" ">hello" "<got:hello"
+        ">wait" "<stopped" ">fg" ">hello" "<got:hello"
     tty_case "tty: inner shell job control" \
         ">$SAND -- bash --norc -i" ">sleep 100 &" ">jobs" "<Running" \
         ">kill %1; wait; echo jo''bs-ok" "<jobs-ok" ">exit" ">echo do''ne:\$?" "<done:0"

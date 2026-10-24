@@ -256,6 +256,41 @@ sandbox cannot run inside another filtered sandbox. The inner one
 refuses with a message; an unfiltered inner sandbox still runs under
 the outer rules.
 
+## How it works
+
+Three processes, one of them on the host:
+
+    your shell ──runs──▶ sand ──unshare, fork──▶ init (pid 1) ──fork, exec──▶ command
+                          ▲                        │  ▲                          │
+                          └── stop reported ───────┘  └── trapped socket calls ──┘
+
+`sand` parses the flags and profiles, unshares the user, mount, pid,
+ipc and uts namespaces (net too, unless `--net host`) and forks
+`init`, which is pid 1 of the new pid namespace and dies with `sand`
+(`PR_SET_PDEATHSIG`), taking the sandbox with it. Init stages the root
+on a tmpfs: the system directories read-only, a fresh `/proc`, `/tmp`
+and a minimal `/dev`, the cwd and every `--ro` and `--rw` at their own
+paths in flag order, `--hide` covered with something empty, then
+`pivot_root` and a read-only remount of `/`. Init then forks the
+command one user namespace lower, mapped to the same uid, so the
+command holds no capability over init, the mounts or the network,
+while init keeps every capability over the command. Init reaps,
+forwards signals, and reports a stop over a pipe so the host shell's
+job stops like any other.
+
+With network rules the command runs under a seccomp filter whose
+address-carrying calls are answered by init, the broker: it takes a
+copy of the socket, copies the address out of the command's memory,
+walks the rules and performs the call itself. Anything that could
+block init, or needs a name resolved, is done again in a short-lived
+worker forked from init, which reports what it learned over a pipe
+before it answers. The details are under Network rules above.
+
+Rules, paths and settings form one flat sequence, later wins: the
+profile `default`, then the command line with each `-p` expanded in
+place. Paths become binds in that order, `net` is a single setting,
+and the last matching `allow` or `block` decides an address.
+
 ## Nesting
 
 `sand` inside `sand` works, as long as the binary is visible
@@ -291,9 +326,14 @@ namespace. `apt install`, `chown` to another user, `mknod`, mounting
 filesystems and any setuid program do not work. Files owned by other
 users appear as owned by nobody and keep their permissions.
 
-Devices. USB, GPUs, audio, cameras and serial ports are simply absent,
-which is the safe default, but there is no flag to let one in. A
-`--dev PATH` for a device node would be the natural extension.
+Devices by default. USB, GPUs, audio, cameras and serial ports are
+absent, and there is no `/sys`. A device node passed with `--rw` works
+as it does outside, with the host's permissions on it: `--rw
+/dev/bus/usb` lets `adb` see the phone, though a program that
+enumerates through `/sys/bus/usb` needs `--ro /sys/bus/usb --ro
+/sys/devices` too. Often the better way is to leave the device with a
+service on the host and allow only its port, as with
+`--net host --allow 127.0.0.1:5037 adb devices`.
 
 Talking to host services. Sockets for X11, Wayland, D-Bus, ssh-agent,
 gpg-agent and Docker live under `/tmp`, `/run` or the home directory

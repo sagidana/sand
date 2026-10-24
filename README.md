@@ -139,6 +139,8 @@ you want to `~/.config/sand`:
     net      host network, but only name lookup and https
     lan      like net, plus the private address ranges
     online   the host's network, unfiltered
+    pypi     the names pip talks to, https only
+    github   github.com and its content hosts, https and ssh
     rw       the current directory is writable
     home     the home directory read-only, minus keys and credentials
 
@@ -150,7 +152,7 @@ gives 127, one that cannot be executed gives 126, like a shell.
 `--net host` gives the command the host's network as is. Adding
 `--allow` or `--block` rules filters it by address and port:
 
-    RULE = [src:][ADDR[/PREFIX]][:PORT[-PORT]] | all
+    RULE = [src:][ADDR[/PREFIX] | NAME][:PORT[-PORT]] | all
 
     1.1.1.1              one address, any port
     10.0.0.0/8:443       a range, one port
@@ -158,6 +160,8 @@ gives 127, one that cannot be executed gives 126, like a shell.
     8000-9000            any address, a port range
     [::1]:80             IPv6 with a port needs brackets
     src:8080             a local port, applies to bind
+    pypi.org:443         the addresses a name resolves to, one port
+    *.github.com         a name and everything below it (quote the *)
 
 Rules apply in order and a later rule wins. As soon as any `--allow`
 is given, everything not allowed is blocked. Destination rules apply
@@ -169,12 +173,48 @@ covers listening sockets and explicit source ports, and to `listen` on
 a socket that was never bound, which would otherwise take a port of
 its own: that counts as a bind to port 0 on every address. A blocked
 call fails with "Network is unreachable" (EACCES for bind and listen)
-and a line on stderr names the address, which helps when wrapping a
-program whose network needs are not documented.
+and a line on stderr names the address and what decided it, the block
+rule or the absence of a matching allow. A lookup of a name no rule
+covers is announced once as well, so when wrapping a program whose
+network needs are not documented the rule to add is on the screen:
+
+    sand: lookup of registry.npmjs.org matches no rule
+    sand: blocked connection to 104.16.1.35 port 443 (no allow rule or allowed name matches)
 
     sand --net host --allow :53 --allow :443 pip install requests
     sand --net host --block :25 ./app
     sand --net host --allow 10.0.0.0/8 --block 10.1.0.0/16 ./app
+
+### Names
+
+A rule written as a name stands for the addresses the name resolves
+to, looked up by `sand` itself through the `/etc/hosts` and
+`/etc/resolv.conf` the command sees. The first name rule also lets
+port 53 through to the nameservers in `/etc/resolv.conf`, and to
+nothing else, since a name rule without lookups is dead; a `block :53`
+written after it still wins. `*.NAME` covers the name and anything
+below it.
+
+    sand --net host --allow pypi.org:443 --allow files.pythonhosted.org:443 pip install requests
+    sand --net host --allow '*.github.com:443' --allow '*.githubusercontent.com:443' git pull
+
+Addresses are learned two ways. When the command connects to an
+address no rule settles, every name in the rules is resolved and the
+call waits for it. And a lookup the broker sees names what to resolve
+next time: that is how `*.github.com` comes to know `api.github.com`.
+Learned addresses are kept for five minutes, then resolved again.
+
+What a name rule is not: a check on the name a connection is for. The
+broker judges addresses, and an address allowed for one name is open
+to every site served on it, which on a shared CDN is many. `block
+NAME` only covers the addresses the name resolves to; a program can
+still connect to them by address. The broker sees a lookup only when
+the query is sent with an address or as a batch (glibc's parallel A
+and AAAA lookup, musl); a query written with `send(2)` on a connected
+socket, as by Go's own resolver or a single-type lookup, is not seen,
+and a `*.NAME` rule learns nothing from it, while a name written out
+in a rule works either way. Lookups over TCP or HTTPS are not seen.
+`--rw` on `/etc/hosts` hands the command the rule table.
 
 How it works: the command runs under a seccomp filter that hands
 `connect`, `bind`, `listen`, `sendmsg`, `sendmmsg` and address-carrying
@@ -209,8 +249,7 @@ besides). The filter closes the ways around the trapped calls:
 Side effects of the broker performing the call: a unix peer that reads
 `SO_PEERCRED` sees init's pid, not the command's, and a socket
 received over a unix socket from a host service passed in with `--rw`
-is a connection the rules never saw. Rules match addresses, not names;
-filtering by domain is not provided.
+is a connection the rules never saw.
 
 The kernel allows one such filter per process chain, so a filtered
 sandbox cannot run inside another filtered sandbox. The inner one
@@ -243,9 +282,9 @@ grow. There is no wall-clock timeout either; use `timeout(1)` in front.
 Real limits need cgroups, which an unprivileged process only gets when
 the system delegates a cgroup to it.
 
-Domain-based network rules. Rules match addresses, not names.
-Filtering by domain needs a resolver under the sandbox's control that
-only answers allowed names and feeds the addresses into the rules.
+Rules on the name a connection is for. A name in a rule is resolved
+to addresses; nothing reads the Host header or the TLS server name, so
+an address shared between sites is shared in the rules too.
 
 Root inside. The command runs as your own user, not as root in a user
 namespace. `apt install`, `chown` to another user, `mknod`, mounting

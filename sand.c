@@ -19,7 +19,11 @@
  * memory first is what makes this race-free. A call that may block,
  * connect on a blocking socket or a send into a full buffer, is done by
  * a short-lived child of init, so one hung peer does not hold up every
- * other socket, the reaping and the stop relay.
+ * other socket, the reaping and the stop relay. A rule written as a
+ * name stands for the addresses the name resolves to: init resolves
+ * names itself, in a worker, and keeps the answers in a table; the
+ * names the command asks a resolver for are read out of the queries it
+ * sends, which is how a *.NAME rule learns what to resolve.
  *
  * Process layout:
  *   sand (host)  ->  init (pid 1 in the sandbox)  ->  command
@@ -66,7 +70,10 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <strings.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
@@ -146,12 +153,81 @@ struct rule {
     int prefix;
     int port_lo;
     int port_hi;
+    char *name;             /* a host name in place of an address, lower case */
+    int wildcard;           /* written *.NAME: the name and anything below it */
+    char *text;             /* the rule as written, for messages */
+    int implicit;           /* added by sand, not written by the user */
 };
 
 #define MAX_RULES 64
 
 static struct rule rules[MAX_RULES];
 static int rule_count = 0;
+
+/* What init knows about names. Name rules are judged by the table of
+ * learned addresses, one entry per rule and address, which expires so
+ * a name that moves is followed. Recent names are what the command has
+ * asked a resolver for; a miss on an address resolves them again, so a
+ * *.NAME rule gets its addresses from the names the command used. A
+ * checked address is one whose miss was resolved already, valid until
+ * a new name comes in (the generation) or it expires. Workers learn in
+ * their own copy and report to init over a pipe. */
+#define MAX_LEARNED 512
+#define MAX_RECENT 64
+#define MAX_CHECKED 128
+#define MAX_ANSWERS 16
+#define MAX_NAME 253
+#define LEARNED_LIFETIME 300
+#define CHECKED_LIFETIME 60
+
+struct learned {
+    int rule;
+    int family;
+    unsigned char addr[16];
+    long expires;
+};
+
+struct checked {
+    int family;
+    unsigned char addr[16];
+    long expires;
+    int gen;
+};
+
+#define REPORT_NAME 1
+#define REPORT_ADDRS 2
+#define REPORT_CHECKED 3
+
+/* One message from a worker to init; under PIPE_BUF, so written whole. */
+struct report {
+    int kind;
+    int rule;
+    int count;
+    int gen;
+    char name[MAX_NAME + 1];
+    int family[MAX_ANSWERS];
+    unsigned char addr[MAX_ANSWERS][16];
+};
+
+static struct learned learned[MAX_LEARNED];
+static int learned_next = 0;
+static char recent[MAX_RECENT][MAX_NAME + 1];
+static int recent_count = 0;
+static int recent_next = 0;
+static int recent_gen = 0;
+static char announced[MAX_RECENT][MAX_NAME + 1];
+static int announced_count = 0;
+static int announced_next = 0;
+static struct checked checked[MAX_CHECKED];
+static int checked_next = 0;
+static int report_pipe[2] = {-1, -1};
+
+/* Set in a worker, which may block and so may resolve names. */
+static int in_worker = 0;
+
+/* Set by the judgment in init when a name rule could still decide the
+ * address: the call is then done again in a worker. */
+static int wants_worker = 0;
 
 /* Pipe pair between init and the command for handing over the seccomp
  * listener; plain read/write, which the filter does not trap. */
@@ -829,6 +905,314 @@ static int rule_matches(const struct rule *r, int family, const unsigned char *a
     return prefix_matches(addr, r->addr, r->prefix);
 }
 
+/* ---- names ---- */
+
+static long now_seconds(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
+}
+
+static int has_name_rules(void)
+{
+    int i;
+
+    for (i = 0; i < rule_count; i++) {
+        if (rules[i].name != NULL) return 1;
+    }
+    return 0;
+}
+
+static int addr_len(int family)
+{
+    if (family == AF_INET) return 4;
+    return 16;
+}
+
+/* Whether a rule written as a name covers NAME: the same name, or for
+ * *.NAME also any name below it. */
+static int name_matches(const struct rule *r, const char *name)
+{
+    size_t rlen;
+    size_t nlen;
+
+    if (r->name == NULL) return 0;
+    if (strcasecmp(r->name, name) == 0) return 1;
+    if (!r->wildcard) return 0;
+    rlen = strlen(r->name);
+    nlen = strlen(name);
+    if (nlen <= rlen + 1) return 0;
+    if (name[nlen - rlen - 1] != '.') return 0;
+    return strcasecmp(name + nlen - rlen, r->name) == 0;
+}
+
+static int name_in_list(char list[][MAX_NAME + 1], int count, const char *name)
+{
+    int i;
+
+    for (i = 0; i < count; i++) {
+        if (strcasecmp(list[i], name) == 0) return 1;
+    }
+    return 0;
+}
+
+static void learn_addr(int rule, int family, const unsigned char *addr)
+{
+    long now = now_seconds();
+    int i;
+
+    for (i = 0; i < MAX_LEARNED; i++) {
+        if (learned[i].expires <= now) continue;
+        if (learned[i].rule != rule || learned[i].family != family) continue;
+        if (memcmp(learned[i].addr, addr, addr_len(family)) != 0) continue;
+        learned[i].expires = now + LEARNED_LIFETIME;
+        return;
+    }
+    learned[learned_next].rule = rule;
+    learned[learned_next].family = family;
+    memcpy(learned[learned_next].addr, addr, 16);
+    learned[learned_next].expires = now + LEARNED_LIFETIME;
+    learned_next = (learned_next + 1) % MAX_LEARNED;
+}
+
+static int learned_has(int rule, int family, const unsigned char *addr)
+{
+    long now = now_seconds();
+    int i;
+
+    for (i = 0; i < MAX_LEARNED; i++) {
+        if (learned[i].expires <= now) continue;
+        if (learned[i].rule != rule || learned[i].family != family) continue;
+        if (memcmp(learned[i].addr, addr, addr_len(family)) == 0) return 1;
+    }
+    return 0;
+}
+
+static void remember_checked(int family, const unsigned char *addr, int gen)
+{
+    checked[checked_next].family = family;
+    memcpy(checked[checked_next].addr, addr, 16);
+    checked[checked_next].expires = now_seconds() + CHECKED_LIFETIME;
+    checked[checked_next].gen = gen;
+    checked_next = (checked_next + 1) % MAX_CHECKED;
+}
+
+static int checked_recently(int family, const unsigned char *addr)
+{
+    long now = now_seconds();
+    int i;
+
+    for (i = 0; i < MAX_CHECKED; i++) {
+        if (checked[i].expires <= now || checked[i].gen != recent_gen) continue;
+        if (checked[i].family != family) continue;
+        if (memcmp(checked[i].addr, addr, addr_len(family)) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Whether unknown destinations are blocked: any allow rule the user
+ * wrote does that; the nameserver rules added for a name do not. */
+static int deny_by_default(int src)
+{
+    int i;
+
+    for (i = 0; i < rule_count; i++) {
+        if (rules[i].src == src && rules[i].allow && !rules[i].implicit) return 1;
+    }
+    return 0;
+}
+
+/* In init: a name the command asked a resolver for. One a rule covers
+ * is kept for resolving on a miss; one no rule covers is announced
+ * once, since under an allow rule its addresses will be blocked and
+ * the name is what the user needs to see. */
+static void remember_name(const char *name)
+{
+    int i;
+    int covered = 0;
+
+    for (i = 0; i < rule_count; i++) {
+        if (name_matches(&rules[i], name)) covered = 1;
+    }
+    if (covered) {
+        if (name_in_list(recent, recent_count, name)) return;
+        snprintf(recent[recent_next], MAX_NAME + 1, "%s", name);
+        recent_next = (recent_next + 1) % MAX_RECENT;
+        if (recent_count < MAX_RECENT) recent_count++;
+        recent_gen++;
+        return;
+    }
+    if (!deny_by_default(0)) return;
+    if (name_in_list(announced, announced_count, name)) return;
+    snprintf(announced[announced_next], MAX_NAME + 1, "%s", name);
+    announced_next = (announced_next + 1) % MAX_RECENT;
+    if (announced_count < MAX_RECENT) announced_count++;
+    fprintf(stderr, "sand: lookup of %s matches no rule\n", name);
+}
+
+static void apply_report(const struct report *rep)
+{
+    int i;
+
+    if (rep->kind == REPORT_NAME) remember_name(rep->name);
+    if (rep->kind == REPORT_ADDRS) {
+        for (i = 0; i < rep->count; i++) learn_addr(rep->rule, rep->family[i], rep->addr[i]);
+    }
+    if (rep->kind == REPORT_CHECKED) remember_checked(rep->family[0], rep->addr[0], rep->gen);
+}
+
+/* Record something learned: here, and in init when this is a worker.
+ * A name is only for init, which prints the announcement. */
+static void note(const struct report *rep)
+{
+    if (!in_worker) {
+        apply_report(rep);
+        return;
+    }
+    if (rep->kind != REPORT_NAME) apply_report(rep);
+    if (write(report_pipe[1], rep, sizeof(*rep)) < 0) return;
+}
+
+/* In init: take in what the workers reported. */
+static void drain_reports(void)
+{
+    struct report rep;
+
+    if (report_pipe[0] < 0) return;
+    for (;;) {
+        if (read(report_pipe[0], &rep, sizeof(rep)) != (ssize_t)sizeof(rep)) return;
+        apply_report(&rep);
+    }
+}
+
+/* In a worker: resolve NAME through the sandbox's /etc/hosts and
+ * resolv.conf, the same files the command uses, and learn the answers
+ * under every name rule that covers it. */
+static void resolve_name(const char *name)
+{
+    struct addrinfo hints;
+    struct addrinfo *res;
+    struct addrinfo *ai;
+    struct report rep;
+    const struct sockaddr_in *in4;
+    const struct sockaddr_in6 *in6;
+    int i;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(name, NULL, &hints, &res) != 0) return;
+    memset(&rep, 0, sizeof(rep));
+    rep.kind = REPORT_ADDRS;
+    for (ai = res; ai != NULL && rep.count < MAX_ANSWERS; ai = ai->ai_next) {
+        if (ai->ai_family == AF_INET) {
+            in4 = (const struct sockaddr_in *)ai->ai_addr;
+            rep.family[rep.count] = AF_INET;
+            memcpy(rep.addr[rep.count], &in4->sin_addr, 4);
+        } else if (ai->ai_family == AF_INET6) {
+            in6 = (const struct sockaddr_in6 *)ai->ai_addr;
+            rep.family[rep.count] = AF_INET6;
+            memcpy(rep.addr[rep.count], in6->sin6_addr.s6_addr, 16);
+        } else {
+            continue;
+        }
+        rep.count++;
+    }
+    freeaddrinfo(res);
+    if (rep.count == 0) return;
+    for (i = 0; i < rule_count; i++) {
+        if (!name_matches(&rules[i], name)) continue;
+        rep.rule = i;
+        note(&rep);
+    }
+}
+
+/* In a worker, for an address no rule has settled: resolve every name
+ * written in a rule and every name the command has asked for, then
+ * mark the address checked so the next call to it is judged from the
+ * table alone. */
+static void resolve_all(int family, const unsigned char *addr)
+{
+    struct report rep;
+    int i;
+    int j;
+    int written;
+
+    for (i = 0; i < rule_count; i++) {
+        if (rules[i].name != NULL && !rules[i].wildcard) resolve_name(rules[i].name);
+    }
+    for (i = 0; i < recent_count; i++) {
+        written = 0;
+        for (j = 0; j < rule_count; j++) {
+            if (rules[j].name != NULL && !rules[j].wildcard && strcasecmp(rules[j].name, recent[i]) == 0) written = 1;
+        }
+        if (!written) resolve_name(recent[i]);
+    }
+    memset(&rep, 0, sizeof(rep));
+    rep.kind = REPORT_CHECKED;
+    rep.family[0] = family;
+    memcpy(rep.addr[0], addr, 16);
+    rep.gen = recent_gen;
+    note(&rep);
+}
+
+/* Walk the rules for one address: the verdict, and in *last the rule
+ * that decided it or -1 for the default. A name rule matches through
+ * the learned table. */
+static int walk_rules(int src, int family, const unsigned char *addr, int port, int *last)
+{
+    int allowed = 1;
+    int i;
+
+    *last = -1;
+    if (deny_by_default(src)) allowed = 0;
+    for (i = 0; i < rule_count; i++) {
+        if (rules[i].src != src) continue;
+        if (port < rules[i].port_lo || port > rules[i].port_hi) continue;
+        if (rules[i].name != NULL) {
+            if (!learned_has(i, family, addr)) continue;
+        } else if (!rule_matches(&rules[i], family, addr, port)) {
+            continue;
+        }
+        allowed = rules[i].allow;
+        *last = i;
+    }
+    return allowed;
+}
+
+/* Whether a name rule after the deciding one could still turn the
+ * verdict once its addresses are known. */
+static int name_pending(int src, int port, int allowed, int last)
+{
+    int i;
+
+    for (i = last + 1; i < rule_count; i++) {
+        if (rules[i].src != src || rules[i].name == NULL) continue;
+        if (port < rules[i].port_lo || port > rules[i].port_hi) continue;
+        if (rules[i].allow != allowed) return 1;
+    }
+    return 0;
+}
+
+/* The line on stderr for a blocked call: the address, and what decided
+ * it, which is what to change in the rules. */
+static void explain_block(int src, int family, const unsigned char *addr, int port, int last)
+{
+    char text[INET6_ADDRSTRLEN];
+    const char *what = src ? "bind to" : "connection to";
+
+    inet_ntop(family, addr, text, sizeof(text));
+    if (last >= 0) {
+        fprintf(stderr, "sand: blocked %s %s port %d (block %s)\n", what, text, port, rules[last].text);
+    } else if (!src && has_name_rules()) {
+        fprintf(stderr, "sand: blocked %s %s port %d (no allow rule or allowed name matches)\n", what, text, port);
+    } else {
+        fprintf(stderr, "sand: blocked %s %s port %d (no allow rule matches)\n", what, text, port);
+    }
+}
+
 /* Decide for one address on an IP socket. The default is allow, or deny
  * as soon as any --allow exists for that direction. Anything that is
  * not an IPv4 or IPv6 address of full length is left to the kernel,
@@ -846,11 +1230,10 @@ static int ip_allowed(const struct sockaddr_storage *ss, socklen_t len, int src)
     const struct sockaddr_in6 *in6;
     const unsigned char *addr;
     const unsigned char *match;
-    char text[INET6_ADDRSTRLEN];
     int family;
     int port;
-    int allowed = 1;
-    int i;
+    int allowed;
+    int last;
 
     if (ss->ss_family == AF_INET && len >= sizeof(*in4)) {
         in4 = (const struct sockaddr_in *)ss;
@@ -873,18 +1256,17 @@ static int ip_allowed(const struct sockaddr_storage *ss, socklen_t len, int src)
     if (!src && family == AF_INET && memcmp(addr, zero, 4) == 0) match = loop4;
     if (!src && family == AF_INET6 && memcmp(addr, zero, 16) == 0) match = loop6;
 
-    for (i = 0; i < rule_count; i++) {
-        if (rules[i].src == src && rules[i].allow) allowed = 0;
+    allowed = walk_rules(src, family, match, port, &last);
+    if (!src && name_pending(src, port, allowed, last) && !checked_recently(family, match)) {
+        /* Only a worker may resolve; init hands the call over. */
+        if (!in_worker) {
+            wants_worker = 1;
+            return 0;
+        }
+        resolve_all(family, match);
+        allowed = walk_rules(src, family, match, port, &last);
     }
-    for (i = 0; i < rule_count; i++) {
-        if (rules[i].src != src) continue;
-        if (!rule_matches(&rules[i], family, match, port)) continue;
-        allowed = rules[i].allow;
-    }
-    if (!allowed) {
-        inet_ntop(family, addr, text, sizeof(text));
-        fprintf(stderr, "sand: blocked %s %s port %d\n", src ? "bind to" : "connection to", text, port);
-    }
+    if (!allowed) explain_block(src, family, addr, port, last);
     return allowed;
 }
 
@@ -1044,6 +1426,66 @@ static int translate_control(struct request *req, struct msghdr *mh, int *taken)
 
 /* Send data read from the command's memory, to the given address if
  * any, with its control data if any. Returns bytes sent or -errno. */
+static int sockaddr_port(const struct sockaddr_storage *ss)
+{
+    if (ss->ss_family == AF_INET) return ntohs(((const struct sockaddr_in *)ss)->sin_port);
+    if (ss->ss_family == AF_INET6) return ntohs(((const struct sockaddr_in6 *)ss)->sin6_port);
+    return -1;
+}
+
+/* A query to a resolver, sent with an address or on a connected datagram
+ * socket, names what the command is about to connect to; the name goes
+ * to init. Only the question of a plain query is read: one name, type
+ * A or AAAA, no compression. A query written with send(2) on a
+ * connected socket is not trapped and so not seen. */
+static void snoop_dns(struct request *req, const struct sockaddr_storage *dst, const unsigned char *msg, size_t len)
+{
+    struct sockaddr_storage peer;
+    socklen_t peer_len = sizeof(peer);
+    socklen_t opt_len = sizeof(int);
+    struct report rep;
+    int type;
+    size_t off = 12;
+    size_t n = 0;
+    size_t i;
+    unsigned int label;
+    int qtype;
+    unsigned char c;
+
+    if (getsockopt(req->sock, SOL_SOCKET, SO_TYPE, &type, &opt_len) < 0 || type != SOCK_DGRAM) return;
+    if (dst == NULL) {
+        if (getpeername(req->sock, (struct sockaddr *)&peer, &peer_len) < 0) return;
+        dst = &peer;
+    }
+    if (sockaddr_port(dst) != 53) return;
+    if (len < 12 + 1 + 4) return;
+    if (msg[2] & 0x80) return;
+    if (msg[4] != 0 || msg[5] != 1) return;
+    memset(&rep, 0, sizeof(rep));
+    for (;;) {
+        if (off >= len) return;
+        label = msg[off];
+        off++;
+        if (label == 0) break;
+        if (label > 63) return;
+        if (off + label > len) return;
+        if (n + label + 1 > MAX_NAME) return;
+        if (n > 0) rep.name[n++] = '.';
+        for (i = 0; i < label; i++) {
+            c = msg[off + i];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c < 0x21 || c > 0x7e) c = '?';
+            rep.name[n++] = c;
+        }
+        off += label;
+    }
+    if (n == 0 || off + 4 > len) return;
+    qtype = (msg[off] << 8) | msg[off + 1];
+    if (qtype != 1 && qtype != 28) return;
+    rep.kind = REPORT_NAME;
+    note(&rep);
+}
+
 static long send_pieces(struct request *req, const struct iovec *remote_iov, int count, unsigned long name_addr, socklen_t name_len, unsigned long control_addr, size_t control_len, int flags)
 {
     struct sockaddr_storage ss;
@@ -1106,6 +1548,7 @@ static long send_pieces(struct request *req, const struct iovec *remote_iov, int
     } else {
         r = 0;
     }
+    if (r == 0 && req->domain != AF_UNIX && has_name_rules()) snoop_dns(req, mh.msg_name, buf, total);
     if (r == 0 && control != NULL) {
         fd_count = translate_control(req, &mh, taken);
         if (fd_count < 0) {
@@ -1183,6 +1626,9 @@ static void do_sendmmsg(struct request *req, struct seccomp_notif_resp *resp)
         write_mem(req->notif.pid, base + i * sizeof(msgs[0]) + offsetof(struct mmsghdr, msg_len), &msgs[i].msg_len, sizeof(msgs[i].msg_len));
         sent++;
     }
+    /* Messages already sent cannot be done again in a worker; the
+     * blocked one comes back on its own in the command's next call. */
+    if (sent > 0) wants_worker = 0;
     if (sent == 0 && r < 0) {
         resp->error = r;
     } else {
@@ -1304,9 +1750,16 @@ static void handle_request(int listener)
     }
 
     if (!needs_worker(&req)) {
+        wants_worker = 0;
         dispatch(&req, &resp);
-        respond(&req, &resp);
-        return;
+        if (!wants_worker) {
+            respond(&req, &resp);
+            return;
+        }
+        /* A name rule may yet decide this address: nothing was done,
+         * so the call is judged again in a worker, which can resolve. */
+        memset(&resp, 0, sizeof(resp));
+        resp.id = req.notif.id;
     }
     worker = fork();
     if (worker < 0) die("fork");
@@ -1314,6 +1767,7 @@ static void handle_request(int listener)
         close(req.sock);
         return;
     }
+    in_worker = 1;
     /* The signal handlers stay, but forward nothing from here. */
     forward_to = 0;
     if (req.domain == AF_UNIX) resp.error = enter_command_fs(req.notif.pid);
@@ -1327,7 +1781,7 @@ static void handle_request(int listener)
  * The reaping also collects the request workers. */
 static int supervise(int listener, pid_t child)
 {
-    struct pollfd fds[2];
+    struct pollfd fds[3];
     struct signalfd_siginfo info;
     sigset_t chld;
     int status;
@@ -1342,14 +1796,20 @@ static int supervise(int listener, pid_t child)
     fds[1].fd = signalfd(-1, &chld, SFD_CLOEXEC);
     fds[1].events = POLLIN;
     if (fds[1].fd < 0) die("signalfd");
+    fds[2].fd = report_pipe[0];
+    fds[2].events = POLLIN;
 
     for (;;) {
         fds[0].revents = 0;
         fds[1].revents = 0;
-        if (poll(fds, 2, -1) < 0) {
+        fds[2].revents = 0;
+        if (poll(fds, 3, -1) < 0) {
             if (errno == EINTR) continue;
             die("poll");
         }
+        /* A worker reports before it answers the command, so what it
+         * learned is in the pipe before the command's next call. */
+        drain_reports();
         if (fds[0].revents & POLLIN) handle_request(listener);
         if (fds[1].revents & POLLIN) {
             if (read(fds[1].fd, &info, sizeof(info)) < 0) die("read signalfd");
@@ -1558,6 +2018,10 @@ static int run_init(const char *cwd)
     if (rule_count > 0) {
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, notify_socket) < 0) die("socketpair");
     }
+    if (has_name_rules()) {
+        if (pipe2(report_pipe, O_CLOEXEC) < 0) die("pipe");
+        if (fcntl(report_pipe[0], F_SETFL, O_NONBLOCK) < 0) die("fcntl");
+    }
 
     child = fork();
     if (child < 0) die("fork");
@@ -1702,9 +2166,112 @@ static void parse_ports(char *text, struct rule *r)
     if (r->port_lo > r->port_hi) fail("bad port range: %s-%s", text, dash + 1);
 }
 
-/* RULE = [src:][ADDR[/PREFIX]][:PORT[-PORT]] | all
+/* A host name: letters, digits, - and _ in dot-separated labels, with
+ * an optional *. in front for the name and everything below it. */
+static void parse_name(const char *text, struct rule *r)
+{
+    const char *p = text;
+    size_t label = 0;
+    size_t i;
+    char c;
+
+    if (strncmp(p, "*.", 2) == 0) {
+        r->wildcard = 1;
+        p += 2;
+    }
+    if (*p == '\0' || strlen(p) > MAX_NAME) fail("bad name: %s", text);
+    for (i = 0; p[i] != '\0'; i++) {
+        c = p[i];
+        if (c == '.') {
+            if (label == 0) fail("bad name: %s", text);
+            label = 0;
+            continue;
+        }
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) fail("bad name: %s", text);
+        label++;
+    }
+    if (label == 0) fail("bad name: %s", text);
+    r->name = strdup(p);
+    if (r->name == NULL) die("strdup");
+    for (i = 0; r->name[i] != '\0'; i++) {
+        if (r->name[i] >= 'A' && r->name[i] <= 'Z') r->name[i] += 'a' - 'A';
+    }
+}
+
+/* Whether the address part of a rule is a name: not an address, which
+ * has only digits, dots and a prefix, and not the word all. */
+static int looks_like_name(const char *text)
+{
+    if (strcmp(text, "all") == 0) return 0;
+    return strspn(text, "0123456789./") != strlen(text);
+}
+
+static void append_rule(const struct rule *r)
+{
+    if (rule_count == MAX_RULES) fail("too many rules (max %d)", MAX_RULES);
+    rules[rule_count] = *r;
+    rule_count++;
+}
+
+/* A name rule can only work if the command can look names up, so the
+ * first one lets port 53 through to the nameservers in /etc/resolv.conf
+ * (the same file the sandbox sees), and nowhere else. Without a
+ * nameserver line the resolver asks this host. */
+static void allow_nameservers(void)
+{
+    FILE *f;
+    char line[256];
+    char *p;
+    char *end;
+    struct rule r;
+    int found = 0;
+
+    f = fopen("/etc/resolv.conf", "r");
+    while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
+        p = line + strspn(line, " \t");
+        if (strncmp(p, "nameserver", 10) != 0 || (p[10] != ' ' && p[10] != '\t')) continue;
+        p += 10;
+        p += strspn(p, " \t");
+        end = p + strcspn(p, " \t\r\n%#");
+        *end = '\0';
+        memset(&r, 0, sizeof(r));
+        if (inet_pton(AF_INET, p, r.addr) == 1) {
+            r.family = AF_INET;
+            r.prefix = 32;
+        } else if (inet_pton(AF_INET6, p, r.addr) == 1) {
+            r.family = AF_INET6;
+            r.prefix = 128;
+        } else {
+            continue;
+        }
+        r.allow = 1;
+        r.implicit = 1;
+        r.port_lo = 53;
+        r.port_hi = 53;
+        if (asprintf(&r.text, "nameserver %s", p) < 0) die("asprintf");
+        append_rule(&r);
+        found = 1;
+    }
+    if (f != NULL) fclose(f);
+    if (found) return;
+    memset(&r, 0, sizeof(r));
+    r.allow = 1;
+    r.implicit = 1;
+    r.family = AF_INET;
+    r.addr[0] = 127;
+    r.addr[3] = 1;
+    r.prefix = 32;
+    r.port_lo = 53;
+    r.port_hi = 53;
+    r.text = "nameserver 127.0.0.1";
+    append_rule(&r);
+}
+
+/* RULE = [src:][ADDR[/PREFIX] | NAME][:PORT[-PORT]] | all
  * An IPv6 address followed by a port needs brackets: [::1]:53.
- * A bare number or range is a port: 443, 8000-9000, src:5000-5100. */
+ * A bare number or range is a port: 443, 8000-9000, src:5000-5100.
+ * A name stands for the addresses it resolves to; *.NAME covers the
+ * names below it too. */
 static void add_rule(const char *arg, int allow)
 {
     char text[256];
@@ -1712,18 +2279,19 @@ static void add_rule(const char *arg, int allow)
     char *addr = NULL;
     char *ports = NULL;
     char *end;
-    struct rule *r;
+    int maybe_name = 0;
+    struct rule r;
 
-    if (rule_count == MAX_RULES) fail("too many rules (max %d)", MAX_RULES);
-    r = &rules[rule_count];
-    memset(r, 0, sizeof(*r));
-    r->allow = allow;
-    r->port_hi = 65535;
+    memset(&r, 0, sizeof(r));
+    r.allow = allow;
+    r.port_hi = 65535;
+    r.text = strdup(arg);
+    if (r.text == NULL) die("strdup");
 
     snprintf(text, sizeof(text), "%s", arg);
     p = text;
     if (strncmp(p, "src:", 4) == 0) {
-        r->src = 1;
+        r.src = 1;
         p += 4;
     }
 
@@ -1740,6 +2308,7 @@ static void add_rule(const char *arg, int allow)
         addr = p;
     } else {
         addr = p;
+        maybe_name = 1;
         end = strchr(p, ':');
         if (end != NULL) {
             *end = '\0';
@@ -1747,10 +2316,16 @@ static void add_rule(const char *arg, int allow)
         }
     }
 
-    if (addr != NULL && *addr != '\0') parse_address(addr, r);
-    if (ports != NULL && *ports != '\0') parse_ports(ports, r);
+    if (addr != NULL && *addr != '\0' && maybe_name && looks_like_name(addr)) {
+        if (r.src) fail("bad rule: %s (src: rules take addresses, not names)", arg);
+        parse_name(addr, &r);
+        if (!has_name_rules()) allow_nameservers();
+    } else if (addr != NULL && *addr != '\0') {
+        parse_address(addr, &r);
+    }
+    if (ports != NULL && *ports != '\0') parse_ports(ports, &r);
     if ((addr == NULL || *addr == '\0') && (ports == NULL || *ports == '\0')) fail("bad rule: %s", arg);
-    rule_count++;
+    append_rule(&r);
 }
 
 /* --env NAME passes the host's value through, --env NAME=VALUE sets one. */

@@ -1,0 +1,7 @@
+# github.com and its content hosts, https and ssh
+net host
+allow github.com:443
+allow github.com:22
+allow api.github.com:443
+allow codeload.github.com:443
+allow *.githubusercontent.com:443

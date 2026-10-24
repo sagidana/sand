@@ -1,0 +1,4 @@
+# the names pip talks to, https only
+net host
+allow pypi.org:443
+allow files.pythonhosted.org:443

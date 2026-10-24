@@ -52,6 +52,12 @@ expect() {
     shift 3
     selected "$name" || return 0
     run "$@"
+    verify "$name" "$want" "$pattern"
+}
+
+# verify NAME STATUS PATTERN: check $status and $out from the last run.
+verify() {
+    local name=$1 want=$2 pattern=$3
     if [ "$status" != "$want" ]; then
         bad "$name" "exit $status, wanted $want; output: $out"
         return
@@ -295,8 +301,128 @@ os.unlink("rel.sock"); os.unlink("dg.sock")
 print(msg, got, s, k, mode)'
     expect "fd passing to an ip socket is refused" 1 "*not supported*" \
         --net host --allow :$PORT python3 -c "import socket, array; t=socket.socket(); t.connect(('127.0.0.1', $PORT)); t.sendmsg([b'x'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [0]))])"
+
+    # names: localhost comes from /etc/hosts, so no network is needed
+    NS=$(awk '/^[[:space:]]*nameserver/ { print $2; exit }' /etc/resolv.conf)
+    NS=${NS:-127.0.0.1}
+    FAM=AF_INET
+    [[ $NS == *:* ]] && FAM=AF_INET6
+    nonblocking='import socket, select, sys; s=socket.socket(); s.setblocking(False); r=s.connect_ex(("127.0.0.1", int(sys.argv[1]))); print(r); select.select([], [s], [], 3); print(s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR))'
+    expect "a name rule resolves through /etc/hosts" 0 "connected" \
+        --net host --allow localhost:$PORT bash -c "$connect"
+    expect "a name rule on another port blocks" 1 "*blocked connection to 127.0.0.1 port $PORT (no allow rule or allowed name matches)*unreachable*" \
+        --net host --allow localhost:1 bash -c "$connect"
+    expect "the second connect is judged from the table" 0 "connected*again" \
+        --net host --allow localhost:$PORT bash -c "$connect && exec 4<>/dev/tcp/127.0.0.1/$PORT && echo again"
+    expect "block by name" 1 "*blocked connection to 127.0.0.1 port $PORT (block localhost)*unreachable*" \
+        --net host --block localhost bash -c "$connect"
+    expect "block by name on another port passes" 0 "connected" \
+        --net host --block localhost:1 bash -c "$connect"
+    expect "a blocked address names the block rule" 1 "*blocked connection to 127.0.0.1 port $PORT (block 127.0.0.0/8)*" \
+        --net host --block 127.0.0.0/8 bash -c "$connect"
+    expect "a blocked address says no allow rule matched" 1 "*blocked connection to 127.0.0.1 port $PORT (no allow rule matches)*" \
+        --net host --allow :1 bash -c "$connect"
+    expect "a name rule lets port 53 through to the nameservers" 0 "1" \
+        --net host --allow localhost:1 python3 -c "import socket; u=socket.socket(socket.$FAM, socket.SOCK_DGRAM); print(u.sendto(b'x', ('$NS', 53)))"
+    expect "and to no other port" 1 "*blocked connection to $NS port 54*" \
+        --net host --allow localhost:1 python3 -c "import socket; u=socket.socket(socket.$FAM, socket.SOCK_DGRAM); print(u.sendto(b'x', ('$NS', 54)))"
+    expect "a non-blocking connect is judged by name too" 0 "115*0" \
+        --net host --allow localhost:$PORT python3 -c "$nonblocking" $PORT
+    expect "a non-blocking connect is blocked by name too" 0 "*blocked connection*101*" \
+        --net host --allow localhost:1 python3 -c "$nonblocking" $PORT
+    expect "src: rules take no names" 1 "*take addresses, not names*" \
+        --net host --allow src:localhost true
+    expect "bad name" 1 "*bad name: bad..name*" \
+        --net host --allow bad..name true
 else
     skipped "network rule cases" "python3 not found"
+fi
+
+# --- names learned from lookups ---------------------------------------
+# A private network namespace with a resolver on 127.0.0.1:53 and
+# /etc/resolv.conf pointing at it, so the command's lookups are seen.
+
+if command -v unshare >/dev/null && command -v python3 >/dev/null && unshare -Urmn true 2>/dev/null; then
+    cat > "$T/dns.py" <<'PY'
+# Runs inside `unshare -Urmn`: brings loopback up, serves DNS on
+# 127.0.0.1:53 answering web/api/other.example.test with 127.0.0.2/3/4, points
+# /etc/resolv.conf there, starts a listener, and runs sand with the
+# given arguments, PORT standing for the listener's port.
+import ctypes, fcntl, os, socket, struct, subprocess, sys, threading
+
+libc = ctypes.CDLL(None, use_errno=True)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ifr = struct.pack("16sH14s", b"lo", 0x1 | 0x40, b"\0" * 14)
+fcntl.ioctl(s.fileno(), 0x8914, ifr)
+s.close()
+
+resolv = sys.argv[1]
+with open(resolv, "w") as f:
+    f.write("nameserver 127.0.0.1\n")
+if libc.mount(resolv.encode(), b"/etc/resolv.conf", None, 4096, None) != 0:
+    sys.exit("mount: " + os.strerror(ctypes.get_errno()))
+
+dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+dns.bind(("127.0.0.1", 53))
+
+def serve():
+    while True:
+        q, peer = dns.recvfrom(512)
+        off = 12
+        labels = []
+        while q[off] != 0:
+            n = q[off]
+            labels.append(q[off + 1:off + 1 + n].decode())
+            off += 1 + n
+        off += 1
+        qtype = struct.unpack("!H", q[off:off + 2])[0]
+        name = ".".join(labels)
+        question = q[12:off + 4]
+        answers = b""
+        count = 0
+        rcode = 0
+        hosts = {"web.example.test": "127.0.0.2", "api.example.test": "127.0.0.3", "other.example.test": "127.0.0.4"}
+        if name not in hosts:
+            rcode = 3
+        elif qtype == 1:
+            answers = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton(hosts[name])
+            count = 1
+        header = q[0:2] + struct.pack("!HHHHH", 0x8180 | rcode, 1, count, 0, 0)
+        dns.sendto(header + question + answers, peer)
+
+threading.Thread(target=serve, daemon=True).start()
+
+lis = socket.socket()
+lis.bind(("0.0.0.0", 0))
+lis.listen()
+port = str(lis.getsockname()[1])
+args = [a.replace("PORT", port) for a in sys.argv[2:]]
+r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+sys.stdout.write(r.stdout.decode())
+sys.exit(r.returncode)
+PY
+    # dns_case NAME STATUS PATTERN ARGS...: like expect, inside the namespace.
+    dns_case() {
+        local name=$1 want=$2 pattern=$3
+        shift 3
+        selected "$name" || return 0
+        out=$(cd "$WORK" && unshare -Urmn python3 "$T/dns.py" "$T/resolv.conf" "$SAND" "$@" 2>&1)
+        status=$?
+        verify "$name" "$want" "$pattern"
+    }
+    conn='import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2]))); print("connected")'
+    dns_case "a name seen in a lookup is resolved on the miss" 0 "connected" \
+        --net host --allow web.example.test:PORT python3 -c "$conn" web.example.test PORT
+    dns_case "*.NAME learns from lookups" 0 "connected" \
+        --net host --allow '*.example.test:PORT' python3 -c "$conn" web.example.test PORT
+    dns_case "a lookup no rule covers is announced" 1 "*lookup of web.example.test matches no rule*blocked connection to 127.0.0.2*" \
+        --net host --allow api.example.test:PORT python3 -c "$conn" web.example.test PORT
+    dns_case "block below a wildcard" 1 "*(block web.example.test)*" \
+        --net host --allow '*.example.test:PORT' --block web.example.test python3 -c "$conn" web.example.test PORT
+    dns_case "block below a wildcard leaves the rest" 0 "connected" \
+        --net host --allow '*.example.test:PORT' --block web.example.test python3 -c "$conn" api.example.test PORT
+else
+    skipped "lookup cases" "unshare -Urmn not available"
 fi
 
 # --- the command below init --------------------------------------------

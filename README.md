@@ -8,6 +8,7 @@ restrictions. One C file, Linux only, no root, no dependencies.
     sand --rw out make                     one writable directory
     sand --net host curl https://example.com
     sand --net host --allow :443 curl https://example.com
+    sand --learn net pip install requests  allow everything, log what it reached
     sand -p dev make                       flags written once, in ~/.config/sand/dev
 
 The sandbox is built from Linux namespaces: the command gets its own
@@ -87,6 +88,7 @@ what nesting uses.
     --net none|host      loopback only (default), or the host's network
     --allow RULE         with --net host: allow matching traffic
     --block RULE         with --net host: block matching traffic
+    --learn net          the host's network, nothing blocked, every destination and lookup logged
     COMMAND [ARG]...     run COMMAND instead of $SHELL
 
 The first word that is not a flag starts the command. A command whose
@@ -95,7 +97,7 @@ name begins with `-` needs `--` in front of it.
 Path flags take files or directories and may repeat. They apply in
 order and a later flag wins, so `--rw .` makes the cwd writable and
 `--ro ~ --hide ~/.ssh` shows the home directory without the keys.
-`--net none` after network rules drops them.
+`--net none` after network rules, or after `--learn net`, drops them.
 
 ## Profiles
 
@@ -173,17 +175,52 @@ covers listening sockets and explicit source ports, and to `listen` on
 a socket that was never bound, which would otherwise take a port of
 its own: that counts as a bind to port 0 on every address. A blocked
 call fails with "Network is unreachable" (EACCES for bind and listen)
-and a line on stderr names the address and what decided it, the block
+and a line in the log names the address and what decided it, the block
 rule or the absence of a matching allow. A lookup of a name no rule
-covers is announced once as well, so when wrapping a program whose
-network needs are not documented the rule to add is on the screen:
+covers is logged once as well, so the rule to add is in the log:
 
-    sand: lookup of registry.npmjs.org matches no rule
-    sand: blocked connection to 104.16.1.35 port 443 (no allow rule or allowed name matches)
+    2026-10-25 09:12:41 sand[4123]: lookup of registry.npmjs.org matches no rule
+    2026-10-25 09:12:41 sand[4123]: blocked connection to 104.16.1.35 port 443 (no allow rule or allowed name matches)
 
     sand --net host --allow :53 --allow :443 pip install requests
     sand --net host --block :25 ./app
     sand --net host --allow 10.0.0.0/8 --block 10.1.0.0/16 ./app
+
+### The log
+
+Everything the broker decides goes to `/tmp/sand.log`, or the file
+named in `$SAND_LOG`, never to the terminal: blocked calls, lookups no
+rule covers, and what learn mode sees. Every run appends to the same
+file, each line stamped with the time and `sand`'s pid, so `tail -f
+/tmp/sand.log` in another terminal follows a running command. The file
+is created with mode 0600 and only when there is a filter to report
+on; a plain `sand make` never touches it. If it cannot be opened, the
+lines go to stderr with a note saying so.
+
+### Learning
+
+When wrapping a program whose network needs are not documented, start
+with `--learn net`: the host's network, nothing blocked, and each
+distinct destination, bind and name lookup logged once as it happens.
+Run the thing to completion, then write the profile from the log:
+
+    sand --learn net pip install requests
+    tail /tmp/sand.log
+
+    2026-10-25 09:14:02 sand[4201]: allowed connection to 127.0.0.53 port 53
+    2026-10-25 09:14:02 sand[4201]: lookup of pypi.org
+    2026-10-25 09:14:02 sand[4201]: allowed connection to 151.101.0.223 port 443
+    2026-10-25 09:14:03 sand[4201]: lookup of files.pythonhosted.org
+    2026-10-25 09:14:03 sand[4201]: allowed connection to 146.75.28.223 port 443
+
+Lookups are read from the queries the command sends, with the same
+limits as for name rules below; a program with its own resolver that
+sends over a connected socket shows only addresses. `--allow` and
+`--block` do not apply in learn mode and are refused after it;
+`--learn net` after rules drops them, and `--net none` after it turns
+it off. Learn mode uses the same filter as rules, so it cannot run
+inside a filtered sandbox either. `net` is the only thing to learn so
+far; the filesystem is decided once, at startup, with nothing to watch.
 
 ### Names
 
@@ -252,7 +289,7 @@ received over a unix socket from a host service passed in with `--rw`
 is a connection the rules never saw.
 
 The kernel allows one such filter per process chain, so a filtered
-sandbox cannot run inside another filtered sandbox. The inner one
+sandbox (rules or learn mode) cannot run inside another filtered sandbox. The inner one
 refuses with a message; an unfiltered inner sandbox still runs under
 the outer rules.
 

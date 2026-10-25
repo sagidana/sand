@@ -20,6 +20,7 @@ mkdir -p "$WORK/sub" "$T/other" "$T/cfg/sand"
 echo hello > "$WORK/file"
 echo other > "$T/other/file"
 export XDG_CONFIG_HOME=$T/cfg
+export SAND_LOG=$T/sand.log
 
 pass=0
 fail=0
@@ -27,9 +28,14 @@ skip=0
 only=("$@")
 
 # Runs sand from $WORK, merging stderr into stdout; sets $out and $status.
+# The log, emptied first, goes in front of the output when it got lines.
 run() {
+    local log
+    : > "$SAND_LOG"
     out=$(cd "$WORK" && "$SAND" "$@" 2>&1)
     status=$?
+    log=$(cat "$SAND_LOG")
+    [ -n "$log" ] && out=$log$'\n'$out
 }
 
 selected() {
@@ -247,6 +253,41 @@ PY
         -p pinned bash -c "$connect"
     expect "--net none after rules drops them" 1 "*refused*" \
         -p pinned --net none bash -c "$connect"
+    expect "--learn net allows and logs the connection" 0 "*sand\[*\]: allowed connection to 127.0.0.1 port $PORT
+connected" \
+        --learn net bash -c "$connect"
+    expect "--learn net logs each destination once" 0 "*allowed connection to 127.0.0.1 port $PORT
+connected*again" \
+        --learn net bash -c "$connect && exec 4<>/dev/tcp/127.0.0.1/$PORT && echo again"
+    expect "--learn net logs a bind" 0 "*allowed bind to 127.0.0.1 port 0
+ok" \
+        --learn net python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print("ok")'
+    expect "rules after --learn net are refused" 1 "*do not apply with --learn*" \
+        --learn net --allow :1 true
+    expect "--learn net after rules drops them" 0 "*allowed connection*
+connected" \
+        -p pinned --learn net bash -c "$connect"
+    expect "--net none after --learn net turns it off" 1 "*refused*" \
+        --learn net --net none bash -c "$connect"
+    expect "--learn takes only net" 1 "*--learn: expected net*" \
+        --learn fs true
+    profile watch "learn net"
+    expect "learn in a profile" 0 "*allowed connection*
+connected" \
+        -p watch bash -c "$connect"
+    if selected "blocked lines go to the log, not the terminal"; then
+        : > "$SAND_LOG"
+        raw=$(cd "$WORK" && "$SAND" --net host --block all bash -c "$connect" 2>&1)
+        if [[ $raw == *blocked* ]]; then
+            bad "blocked lines go to the log, not the terminal" "terminal: $raw"
+        elif ! grep -q "sand\[[0-9]*\]: blocked connection to 127.0.0.1 port $PORT (block all)" "$SAND_LOG"; then
+            bad "blocked lines go to the log, not the terminal" "log: $(cat "$SAND_LOG")"
+        else
+            ok "blocked lines go to the log, not the terminal"
+        fi
+    fi
+    expect "a run without a filter leaves the log alone" 0 "yes" \
+        --net host bash -c "$connect >/dev/null; echo yes"
 
     # What the filter closes besides addresses.
     expect "io_uring is absent" 0 "Function not implemented" \
@@ -307,6 +348,10 @@ print(msg, got, s, k, mode)'
     NS=${NS:-127.0.0.1}
     FAM=AF_INET
     [[ $NS == *:* ]] && FAM=AF_INET6
+    expect "--learn net logs a lookup once" 0 "*allowed connection to $NS port 53
+*lookup of example.com
+ok" \
+        --learn net python3 -c "import socket; u=socket.socket(socket.$FAM, socket.SOCK_DGRAM); q=b'\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07example\\x03com\\x00\\x00\\x01\\x00\\x01'; u.sendto(q, ('$NS', 53)); u.sendto(q, ('$NS', 53)); print('ok')"
     nonblocking='import socket, select, sys; s=socket.socket(); s.setblocking(False); r=s.connect_ex(("127.0.0.1", int(sys.argv[1]))); print(r); select.select([], [s], [], 3); print(s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR))'
     expect "a name rule resolves through /etc/hosts" 0 "connected" \
         --net host --allow localhost:$PORT bash -c "$connect"
@@ -403,11 +448,14 @@ sys.exit(r.returncode)
 PY
     # dns_case NAME STATUS PATTERN ARGS...: like expect, inside the namespace.
     dns_case() {
-        local name=$1 want=$2 pattern=$3
+        local name=$1 want=$2 pattern=$3 log
         shift 3
         selected "$name" || return 0
+        : > "$SAND_LOG"
         out=$(cd "$WORK" && unshare -Urmn python3 "$T/dns.py" "$T/resolv.conf" "$SAND" "$@" 2>&1)
         status=$?
+        log=$(cat "$SAND_LOG")
+        [ -n "$log" ] && out=$log$'\n'$out
         verify "$name" "$want" "$pattern"
     }
     conn='import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2]))); print("connected")'

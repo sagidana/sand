@@ -164,6 +164,16 @@ struct rule {
 static struct rule rules[MAX_RULES];
 static int rule_count = 0;
 
+/* --learn net: the host's network, every call allowed, and each distinct
+ * destination, bind and lookup written to the log once. */
+static int learn_mode = 0;
+
+/* Whether the command runs under the seccomp filter and init brokers. */
+static int filtered(void)
+{
+    return rule_count > 0 || learn_mode;
+}
+
 /* What init knows about names. Name rules are judged by the table of
  * learned addresses, one entry per rule and address, which expires so
  * a name that moves is followed. Recent names are what the command has
@@ -197,6 +207,7 @@ struct checked {
 #define REPORT_NAME 1
 #define REPORT_ADDRS 2
 #define REPORT_CHECKED 3
+#define REPORT_SEEN 4
 
 /* One message from a worker to init; under PIPE_BUF, so written whole. */
 struct report {
@@ -204,6 +215,8 @@ struct report {
     int rule;
     int count;
     int gen;
+    int src;
+    int port;
     char name[MAX_NAME + 1];
     int family[MAX_ANSWERS];
     unsigned char addr[MAX_ANSWERS][16];
@@ -221,6 +234,21 @@ static int announced_next = 0;
 static struct checked checked[MAX_CHECKED];
 static int checked_next = 0;
 static int report_pipe[2] = {-1, -1};
+
+/* In learn mode, what was logged already: one line per distinct
+ * destination or bind. */
+#define MAX_SEEN 256
+
+struct seen {
+    int src;
+    int family;
+    unsigned char addr[16];
+    int port;
+};
+
+static struct seen seen[MAX_SEEN];
+static int seen_count = 0;
+static int seen_next = 0;
 
 /* Set in a worker, which may block and so may resolve names. */
 static int in_worker = 0;
@@ -286,6 +314,46 @@ static void fail(const char *fmt, ...)
     report(fmt, ap, 0);
     va_end(ap);
     exit(1);
+}
+
+/* What the broker decided goes to the log, $SAND_LOG or /tmp/sand.log,
+ * shared by every run: each line carries the time and sand's pid and
+ * is written whole, so runs appending together do not interleave.
+ * Opened only when there is a filter to report on; stderr stands in
+ * when it cannot be. */
+#define DEFAULT_LOG "/tmp/sand.log"
+
+static int log_fd = -1;
+
+static void open_log(void)
+{
+    const char *path = getenv("SAND_LOG");
+
+    if (path == NULL || path[0] == '\0') path = DEFAULT_LOG;
+    log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (log_fd < 0) fprintf(stderr, "sand: cannot open %s: %s; those lines go to stderr\n", path, strerror(errno));
+}
+
+static void logline(const char *fmt, ...)
+{
+    char buf[1024];
+    struct tm tm;
+    time_t now;
+    va_list ap;
+    int fd = log_fd;
+    int n;
+
+    if (fd < 0) fd = 2;
+    now = time(NULL);
+    localtime_r(&now, &tm);
+    n = strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    n += snprintf(buf + n, sizeof(buf) - n, " sand[%d]: ", sand_pid);
+    va_start(ap, fmt);
+    n += vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(buf) - 1) n = sizeof(buf) - 1;
+    buf[n] = '\n';
+    if (write(fd, buf, n + 1) < 0) return;
 }
 
 static void write_file(const char *path, const char *text)
@@ -769,7 +837,7 @@ static int install_filter(void)
     prog.len = sizeof(filter) / sizeof(filter[0]);
     prog.filter = filter;
     listener = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
-    if (listener < 0 && errno == EBUSY) fail("--allow/--block cannot be used inside a sandbox that already has them (the kernel allows one listener); the outer rules still apply");
+    if (listener < 0 && errno == EBUSY) fail("--allow/--block and --learn cannot be used inside a sandbox that already filters (the kernel allows one listener); the outer rules still apply");
     if (listener < 0) die("seccomp");
     return listener;
 }
@@ -1024,15 +1092,30 @@ static int deny_by_default(int src)
     return 0;
 }
 
-/* In init: a name the command asked a resolver for. One a rule covers
- * is kept for resolving on a miss; one no rule covers is announced
- * once, since under an allow rule its addresses will be blocked and
- * the name is what the user needs to see. */
+/* Whether NAME is new to the log: true the first time. */
+static int announce(const char *name)
+{
+    if (name_in_list(announced, announced_count, name)) return 0;
+    snprintf(announced[announced_next], MAX_NAME + 1, "%s", name);
+    announced_next = (announced_next + 1) % MAX_RECENT;
+    if (announced_count < MAX_RECENT) announced_count++;
+    return 1;
+}
+
+/* In init: a name the command asked a resolver for. In learn mode it
+ * is logged once. Otherwise one a rule covers is kept for resolving on
+ * a miss, and one no rule covers is logged once, since under an allow
+ * rule its addresses will be blocked and the name is what the user
+ * needs to see. */
 static void remember_name(const char *name)
 {
     int i;
     int covered = 0;
 
+    if (learn_mode) {
+        if (announce(name)) logline("lookup of %s", name);
+        return;
+    }
     for (i = 0; i < rule_count; i++) {
         if (name_matches(&rules[i], name)) covered = 1;
     }
@@ -1045,11 +1128,27 @@ static void remember_name(const char *name)
         return;
     }
     if (!deny_by_default(0)) return;
-    if (name_in_list(announced, announced_count, name)) return;
-    snprintf(announced[announced_next], MAX_NAME + 1, "%s", name);
-    announced_next = (announced_next + 1) % MAX_RECENT;
-    if (announced_count < MAX_RECENT) announced_count++;
-    fprintf(stderr, "sand: lookup of %s matches no rule\n", name);
+    if (announce(name)) logline("lookup of %s matches no rule", name);
+}
+
+/* In init, learn mode: log a destination or bind the first time. */
+static void remember_seen(int src, int family, const unsigned char *addr, int port)
+{
+    char text[INET6_ADDRSTRLEN];
+    int i;
+
+    for (i = 0; i < seen_count; i++) {
+        if (seen[i].src != src || seen[i].family != family || seen[i].port != port) continue;
+        if (memcmp(seen[i].addr, addr, addr_len(family)) == 0) return;
+    }
+    seen[seen_next].src = src;
+    seen[seen_next].family = family;
+    memcpy(seen[seen_next].addr, addr, 16);
+    seen[seen_next].port = port;
+    seen_next = (seen_next + 1) % MAX_SEEN;
+    if (seen_count < MAX_SEEN) seen_count++;
+    inet_ntop(family, addr, text, sizeof(text));
+    logline("allowed %s %s port %d", src ? "bind to" : "connection to", text, port);
 }
 
 static void apply_report(const struct report *rep)
@@ -1057,6 +1156,7 @@ static void apply_report(const struct report *rep)
     int i;
 
     if (rep->kind == REPORT_NAME) remember_name(rep->name);
+    if (rep->kind == REPORT_SEEN) remember_seen(rep->src, rep->family[0], rep->addr[0], rep->port);
     if (rep->kind == REPORT_ADDRS) {
         for (i = 0; i < rep->count; i++) learn_addr(rep->rule, rep->family[i], rep->addr[i]);
     }
@@ -1064,14 +1164,14 @@ static void apply_report(const struct report *rep)
 }
 
 /* Record something learned: here, and in init when this is a worker.
- * A name is only for init, which prints the announcement. */
+ * A name or a seen address is only for init, which writes the log. */
 static void note(const struct report *rep)
 {
     if (!in_worker) {
         apply_report(rep);
         return;
     }
-    if (rep->kind != REPORT_NAME) apply_report(rep);
+    if (rep->kind != REPORT_NAME && rep->kind != REPORT_SEEN) apply_report(rep);
     if (write(report_pipe[1], rep, sizeof(*rep)) < 0) return;
 }
 
@@ -1196,8 +1296,8 @@ static int name_pending(int src, int port, int allowed, int last)
     return 0;
 }
 
-/* The line on stderr for a blocked call: the address, and what decided
- * it, which is what to change in the rules. */
+/* The log line for a blocked call: the address, and what decided it,
+ * which is what to change in the rules. */
 static void explain_block(int src, int family, const unsigned char *addr, int port, int last)
 {
     char text[INET6_ADDRSTRLEN];
@@ -1205,16 +1305,17 @@ static void explain_block(int src, int family, const unsigned char *addr, int po
 
     inet_ntop(family, addr, text, sizeof(text));
     if (last >= 0) {
-        fprintf(stderr, "sand: blocked %s %s port %d (block %s)\n", what, text, port, rules[last].text);
+        logline("blocked %s %s port %d (block %s)", what, text, port, rules[last].text);
     } else if (!src && has_name_rules()) {
-        fprintf(stderr, "sand: blocked %s %s port %d (no allow rule or allowed name matches)\n", what, text, port);
+        logline("blocked %s %s port %d (no allow rule or allowed name matches)", what, text, port);
     } else {
-        fprintf(stderr, "sand: blocked %s %s port %d (no allow rule matches)\n", what, text, port);
+        logline("blocked %s %s port %d (no allow rule matches)", what, text, port);
     }
 }
 
-/* Decide for one address on an IP socket. The default is allow, or deny
- * as soon as any --allow exists for that direction. Anything that is
+/* Decide for one address on an IP socket. In learn mode everything is
+ * allowed and logged. Otherwise the default is allow, or deny as soon
+ * as any --allow exists for that direction. Anything that is
  * not an IPv4 or IPv6 address of full length is left to the kernel,
  * which judges the very bytes copied here and rejects them (except
  * AF_UNSPEC, which disconnects). IPv4 carried on an IPv6 socket as
@@ -1234,6 +1335,7 @@ static int ip_allowed(const struct sockaddr_storage *ss, socklen_t len, int src)
     int port;
     int allowed;
     int last;
+    struct report rep;
 
     if (ss->ss_family == AF_INET && len >= sizeof(*in4)) {
         in4 = (const struct sockaddr_in *)ss;
@@ -1256,6 +1358,16 @@ static int ip_allowed(const struct sockaddr_storage *ss, socklen_t len, int src)
     if (!src && family == AF_INET && memcmp(addr, zero, 4) == 0) match = loop4;
     if (!src && family == AF_INET6 && memcmp(addr, zero, 16) == 0) match = loop6;
 
+    if (learn_mode) {
+        memset(&rep, 0, sizeof(rep));
+        rep.kind = REPORT_SEEN;
+        rep.src = src;
+        rep.port = port;
+        rep.family[0] = family;
+        memcpy(rep.addr[0], addr, addr_len(family));
+        note(&rep);
+        return 1;
+    }
     allowed = walk_rules(src, family, match, port, &last);
     if (!src && name_pending(src, port, allowed, last) && !checked_recently(family, match)) {
         /* Only a worker may resolve; init hands the call over. */
@@ -1286,7 +1398,7 @@ static int unix_allowed(const struct sockaddr_storage *ss, socklen_t len, int sr
     if (un->sun_path[0] != '\0') return 1;
     n = len - head - 1;
     if (n > (int)sizeof(un->sun_path) - 1) n = sizeof(un->sun_path) - 1;
-    fprintf(stderr, "sand: blocked %s abstract socket @%.*s\n", src ? "bind to" : "connection to", n, un->sun_path + 1);
+    logline("blocked %s abstract socket @%.*s", src ? "bind to" : "connection to", n, un->sun_path + 1);
     return 0;
 }
 
@@ -1548,7 +1660,7 @@ static long send_pieces(struct request *req, const struct iovec *remote_iov, int
     } else {
         r = 0;
     }
-    if (r == 0 && req->domain != AF_UNIX && has_name_rules()) snoop_dns(req, mh.msg_name, buf, total);
+    if (r == 0 && req->domain != AF_UNIX && (has_name_rules() || learn_mode)) snoop_dns(req, mh.msg_name, buf, total);
     if (r == 0 && control != NULL) {
         fd_count = translate_control(req, &mh, taken);
         if (fd_count < 0) {
@@ -1940,7 +2052,7 @@ static void run_command(void)
     if (prctl(PR_SET_DUMPABLE, 1) < 0) die("prctl");
     own_user_namespace(0);
 
-    if (rule_count > 0) {
+    if (filtered()) {
         /* Tell init the listener's fd number, wait until it has taken a
          * copy, then drop ours so the command never holds it. */
         listener = install_filter();
@@ -2015,10 +2127,10 @@ static int run_init(const char *cwd)
     build_root(cwd);
     if (sethostname("sand", 4) < 0) die("sethostname");
 
-    if (rule_count > 0) {
+    if (filtered()) {
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, notify_socket) < 0) die("socketpair");
     }
-    if (has_name_rules()) {
+    if (has_name_rules() || learn_mode) {
         if (pipe2(report_pipe, O_CLOEXEC) < 0) die("pipe");
         if (fcntl(report_pipe[0], F_SETFL, O_NONBLOCK) < 0) die("fcntl");
     }
@@ -2030,7 +2142,7 @@ static int run_init(const char *cwd)
     forward_to = child;
     install_signal_handlers();
 
-    if (rule_count > 0) {
+    if (filtered()) {
         close(notify_socket[1]);
         if (read(notify_socket[0], &number, sizeof(number)) == sizeof(number)) {
             pidfd = syscall(SYS_pidfd_open, child, 0);
@@ -2347,12 +2459,13 @@ static void add_env(const char *arg)
     extra_env_count++;
 }
 
-/* --net none after --allow/--block rules drops them: a later flag wins,
- * and without the host's network there is nothing left to filter. */
+/* --net none after --allow/--block rules or --learn drops them: a later
+ * flag wins, and without the host's network there is nothing to see. */
 static void set_net(const char *arg)
 {
     if (strcmp(arg, "none") == 0) {
         host_network = 0;
+        learn_mode = 0;
         rule_count = 0;
         return;
     }
@@ -2361,6 +2474,16 @@ static void set_net(const char *arg)
         return;
     }
     fail("--net: expected none or host, got %s", arg);
+}
+
+/* --learn net: the host's network with nothing blocked, logging what is
+ * reached. It replaces rules written before it. */
+static void set_learn(const char *arg)
+{
+    if (strcmp(arg, "net") != 0) fail("--learn: expected net, got %s", arg);
+    host_network = 1;
+    learn_mode = 1;
+    rule_count = 0;
 }
 
 /* Profiles are files of flags under $XDG_CONFIG_HOME/sand, by default
@@ -2462,6 +2585,10 @@ static int apply_flag(const char *name, const char *value)
         set_net(value);
         return 1;
     }
+    if (strcmp(name, "learn") == 0) {
+        set_learn(value);
+        return 1;
+    }
     if (strcmp(name, "allow") == 0) {
         add_rule(value, 1);
         return 1;
@@ -2479,7 +2606,7 @@ static int apply_flag(const char *name, const char *value)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: sand [-p NAME | --ro PATH | --rw PATH | --hide PATH | --env NAME[=VALUE] | --net none|host | --allow RULE | --block RULE]... [COMMAND [ARG]...]\n");
+    fprintf(stderr, "usage: sand [-p NAME | --ro PATH | --rw PATH | --hide PATH | --env NAME[=VALUE] | --net none|host | --learn net | --allow RULE | --block RULE]... [COMMAND [ARG]...]\n");
     fprintf(stderr, "  -p, --profile NAME load the flags in ~/.config/sand/NAME\n");
     fprintf(stderr, "  --ro PATH          also make PATH visible, read-only\n");
     fprintf(stderr, "  --rw PATH          also make PATH visible, writable\n");
@@ -2489,10 +2616,12 @@ static void usage(void)
     fprintf(stderr, "  --net none|host    no network (default), or the host's\n");
     fprintf(stderr, "  --allow RULE       with --net host: allow matching traffic\n");
     fprintf(stderr, "  --block RULE       with --net host: block matching traffic\n");
+    fprintf(stderr, "  --learn net        the host's network, nothing blocked, every destination and lookup logged\n");
     fprintf(stderr, "  COMMAND [ARG]...   run COMMAND instead of $SHELL; -- before it if it starts with -\n");
     fprintf(stderr, "RULE = [src:][ADDR[/PREFIX]][:PORT[-PORT]] | all, e.g. :443, 10.0.0.0/8, [::1]:53, src:8080.\n");
     fprintf(stderr, "Flags may repeat; a later flag wins. Use --rw . for a writable cwd.\n");
     fprintf(stderr, "The profile ~/.config/sand/default, if present, is loaded first.\n");
+    fprintf(stderr, "Blocked calls and what --learn sees are logged to $SAND_LOG or /tmp/sand.log.\n");
     exit(2);
 }
 
@@ -2508,6 +2637,7 @@ int main(int argc, char **argv)
     if (strcmp(cwd, "/") == 0) fail("refusing to sandbox the root directory");
     add_path(cwd, 1, 0);
     add_resolv_conf();
+    sand_pid = getpid();
 
     load_profile("default", 0);
 
@@ -2534,6 +2664,8 @@ int main(int argc, char **argv)
     }
 
     if (rule_count > 0 && !host_network) fail("--allow and --block need --net host");
+    if (rule_count > 0 && learn_mode) fail("--allow and --block do not apply with --learn, which allows everything and logs it");
+    if (filtered()) open_log();
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) die("no_new_privs");
     find_terminal();
@@ -2543,7 +2675,6 @@ int main(int argc, char **argv)
     enter_namespaces();
 
     /* unshare(CLONE_NEWPID) only applies to children: fork to get pid 1. */
-    sand_pid = getpid();
     init = fork();
     if (init < 0) die("fork");
     if (init == 0) exit(run_init(cwd));

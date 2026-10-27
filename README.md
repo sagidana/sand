@@ -150,7 +150,13 @@ you want to `~/.config/sand`:
     home     the home directory read-only, minus keys and credentials
 
 The command's exit status is returned. A command that cannot be found
-gives 127, one that cannot be executed gives 126, like a shell.
+gives 127, one that cannot be executed gives 126, like a shell. When
+the host has the command somewhere the sandbox does not show, the
+error names the place:
+
+    $ sand claude
+    sand: claude: No such file or directory
+    sand: on the host it is /home/s/.local/bin/claude; pass --ro /home/s/.local/bin/claude
 
 ## Network rules
 
@@ -381,9 +387,10 @@ and are hidden. Each can be let in with `--rw` on the socket path plus
 `--env` for the variable that names it, but nothing does it for you.
 
 Software outside the system directories. Toolchains under the home
-directory, `/opt`, `/snap` or `/nix` have to be passed with `--ro`.
-`PATH` is inherited, so a missing directory silently falls through to
-the system version of a program.
+directory, `/opt`, `/snap` or `/nix` have to be passed with `--ro`. A
+program only the host has is reported with its path, but `PATH` is
+inherited, so one the system also has silently falls through to the
+system version: `~/.local/bin/python` gives way to `/usr/bin/python`.
 
 Throw-away writes. There is no copy-on-write mode where the command
 may write anywhere and the changes are discarded afterwards. Overlay

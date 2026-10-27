@@ -141,6 +141,11 @@ static int bind_count = 0;
 /* The command to run, NULL-terminated argv; empty means the shell. */
 static char **command = NULL;
 
+/* Where the host finds the command, looked up before the namespaces are
+ * entered. A failed exec inside names it: the program is usually in a
+ * place the sandbox does not show. NULL when the host lacks it too. */
+static char *host_command = NULL;
+
 /* --net host: stay in the host's network namespace. */
 static int host_network = 0;
 
@@ -2031,6 +2036,58 @@ static void own_user_namespace(int flags)
     write_file("/proc/self/uid_map", map);
 }
 
+static void find_host_command(const char *cwd)
+{
+    const char *path;
+    const char *p;
+    const char *end;
+    char *candidate;
+
+    if (command == NULL) return;
+    if (strchr(command[0], '/') != NULL) {
+        if (command[0][0] == '/') candidate = strdup(command[0]);
+        else if (asprintf(&candidate, "%s/%s", cwd, command[0]) < 0) die("asprintf");
+        if (candidate == NULL) die("strdup");
+        if (access(candidate, X_OK) == 0) host_command = candidate;
+        else free(candidate);
+        return;
+    }
+    path = getenv("PATH");
+    if (path == NULL) return;
+    for (p = path; ; p = end + 1) {
+        end = strchrnul(p, ':');
+        /* An empty entry means the cwd, as it does for execvp. */
+        if (end == p) {
+            if (asprintf(&candidate, "%s/%s", cwd, command[0]) < 0) die("asprintf");
+        } else if (*p != '/') {
+            if (asprintf(&candidate, "%s/%.*s/%s", cwd, (int)(end - p), p, command[0]) < 0) die("asprintf");
+        } else {
+            if (asprintf(&candidate, "%.*s/%s", (int)(end - p), p, command[0]) < 0) die("asprintf");
+        }
+        if (access(candidate, X_OK) == 0) {
+            host_command = candidate;
+            return;
+        }
+        free(candidate);
+        if (*end == '\0') return;
+    }
+}
+
+/* After an exec that failed with ENOENT. PATH is inherited, so a
+ * program under the home directory or /opt is found by the host and
+ * missing inside without a word about why; say where it is. A program
+ * that is present inside fails with ENOENT when its #! interpreter is
+ * not. */
+static void explain_missing(void)
+{
+    if (host_command == NULL) return;
+    if (access(host_command, F_OK) < 0) {
+        fprintf(stderr, "sand: on the host it is %s; pass --ro %s\n", host_command, host_command);
+    } else {
+        fprintf(stderr, "sand: %s is visible; what is missing is its interpreter, the program on its #! line\n", host_command);
+    }
+}
+
 static void run_command(void)
 {
     const char *shell = getenv("SHELL");
@@ -2080,9 +2137,11 @@ static void run_command(void)
     if (command != NULL) {
         execvpe(command[0], command, env);
         /* Same codes a shell uses, so callers can tell these apart. */
-        fprintf(stderr, "sand: %s: %s\n", command[0], strerror(errno));
-        if (errno == ENOENT) exit(127);
-        exit(126);
+        i = errno;
+        fprintf(stderr, "sand: %s: %s\n", command[0], strerror(i));
+        if (i != ENOENT) exit(126);
+        explain_missing();
+        exit(127);
     }
     if (shell != NULL) execle(shell, shell, (char *)NULL, env);
     execle("/bin/sh", "/bin/sh", (char *)NULL, env);
@@ -2713,6 +2772,7 @@ int main(int argc, char **argv)
     if (filtered()) open_log();
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) die("no_new_privs");
+    find_host_command(cwd);
     find_terminal();
     if (tty_fd >= 0) {
         if (pipe2(stop_pipe, O_CLOEXEC) < 0) die("pipe");

@@ -143,6 +143,19 @@ expect "exit status passes through" 7 "" \
     sh -c 'exit 7'
 expect "missing command gives 127" 127 "*No such file*" \
     no-such-command
+mkdir -p "$T/bin"
+printf '#!/bin/sh\necho hostonly\n' > "$T/bin/hostonly"
+printf '#!/nowhere/sh\n' > "$T/bin/nointerp"
+chmod +x "$T/bin/hostonly" "$T/bin/nointerp"
+PATH=$T/bin:$PATH expect "missing command names where the host has it" 127 \
+    "*No such file*on the host it is $T/bin/hostonly; pass --ro $T/bin/hostonly" \
+    hostonly
+PATH=$T/bin:$PATH expect "the named --ro then runs it" 0 "hostonly" \
+    --ro "$T/bin/hostonly" hostonly
+expect "missing command by absolute path names it" 127 "*pass --ro $T/bin/hostonly" \
+    "$T/bin/hostonly"
+PATH=$T/bin:$PATH expect "missing interpreter is told apart" 127 "*No such file*interpreter*" \
+    --ro "$T/bin" nointerp
 expect "unknown flag gives usage" 2 "usage:*" \
     --bogus true
 expect "-- still separates the command" 0 "ok" \

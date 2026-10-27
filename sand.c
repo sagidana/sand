@@ -58,6 +58,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include <limits.h>
 #include <poll.h>
 #include <sched.h>
@@ -121,6 +122,7 @@ static const char *devices[] = {
 struct bind {
     char *path;      /* on the host */
     char *dst;       /* inside the sandbox, normally the same */
+    char *link;      /* the path as given when that is a symlink to dst */
     int read_only;
     int hide;        /* cover dst with something empty instead */
     int fd;
@@ -477,6 +479,7 @@ static void add_bind(const struct bind *b)
 
     if (b->hide) {
         hide_path(b->dst);
+        if (b->link != NULL) hide_path(b->link);
         return;
     }
 
@@ -499,6 +502,18 @@ static void add_bind(const struct bind *b)
         close(fd);
     }
     bind_path(src, dst, b->read_only);
+
+    /* The link the user named, pointing at the target just bound. An
+     * absolute target, whatever the host's link says, so it resolves
+     * from anywhere. EEXIST: a bind of the directory brought the host's
+     * own link along. */
+    if (b->link == NULL) return;
+    snprintf(dst, sizeof(dst), STAGE "%s", b->link);
+    slash = strrchr(dst, '/');
+    *slash = '\0';
+    make_dirs(dst);
+    *slash = '/';
+    if (symlink(b->dst, dst) < 0 && errno != EEXIST) die("symlink %s", b->link);
 }
 
 static void add_dev(void)
@@ -2183,13 +2198,42 @@ static char *expand_home(const char *arg)
     return path;
 }
 
+/* The absolute path ARG names, with everything but the last component
+ * resolved: where a symlink given on the command line is, as opposed
+ * to where it points. */
+static char *link_path(const char *arg)
+{
+    char *dir_copy;
+    char *base_copy;
+    char *dir;
+    char *path;
+
+    dir_copy = strdup(arg);
+    base_copy = strdup(arg);
+    if (dir_copy == NULL || base_copy == NULL) die("strdup");
+    dir = realpath(dirname(dir_copy), NULL);
+    if (dir == NULL) die("%s", arg);
+    if (asprintf(&path, "%s/%s", strcmp(dir, "/") == 0 ? "" : dir, basename(base_copy)) < 0) die("asprintf");
+    free(dir);
+    free(dir_copy);
+    free(base_copy);
+    return path;
+}
+
 static void add_path(const char *arg, int read_only, int hide)
 {
     char *expanded;
     char *path;
+    char *link = NULL;
+    struct stat st;
 
     if (bind_count == MAX_BINDS) fail("too many paths (max %d)", MAX_BINDS);
     expanded = expand_home(arg);
+    /* A symlink keeps its name: the target is bound at its own path and
+     * the link recreated at the path given, so an installer's
+     * ~/.local/bin/x -> ~/.local/share/x/bin/x works as it does outside.
+     * A trailing slash follows the link, as lstat does. */
+    if (lstat(expanded, &st) == 0 && S_ISLNK(st.st_mode)) link = link_path(expanded);
     path = realpath(expanded, NULL);
     free(expanded);
     /* A path that does not exist is already invisible. */
@@ -2198,6 +2242,7 @@ static void add_path(const char *arg, int read_only, int hide)
     if (strcmp(path, "/") == 0) fail("refusing to bind the root directory");
     binds[bind_count].path = path;
     binds[bind_count].dst = path;
+    binds[bind_count].link = link;
     binds[bind_count].read_only = read_only;
     binds[bind_count].hide = hide;
     bind_count++;

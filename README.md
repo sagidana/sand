@@ -97,6 +97,9 @@ name begins with `-` needs `--` in front of it.
 Path flags take files or directories and may repeat. They apply in
 order and a later flag wins, so `--rw .` makes the cwd writable and
 `--ro ~ --hide ~/.ssh` shows the home directory without the keys.
+A symlink is shown as a link to its target, and the target at its own
+path, so `--ro ~/.local/bin/claude` works when the installer put a link
+there and the program under `~/.local/share`.
 `--net none` after network rules, or after `--learn net`, drops them.
 
 ## Profiles

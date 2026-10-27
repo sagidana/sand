@@ -93,6 +93,18 @@ expect "--rw adds a writable path" 0 "ok" \
     --rw "$T/other" sh -c 'touch '"$T"'/other/x && echo ok'
 expect "paths outside are absent" 1 "*No such file*" \
     cat "$T/other/file"
+ln -s "$T/other/file" "$T/link"
+ln -s other/file "$T/rel"
+echo w > "$T/other/w"
+ln -s "$T/other/w" "$T/wlink"
+expect "--ro on a symlink shows the link and its target" 0 "other other $T/other/file" \
+    --ro "$T/link" sh -c 'echo $(cat '"$T"'/link) $(cat '"$T"'/other/file) $(readlink '"$T"'/link)'
+expect "--ro on a relative symlink" 0 "other" \
+    --ro "$T/rel" cat "$T/rel"
+expect "--rw on a symlink writes through it" 0 "ok" \
+    --rw "$T/wlink" sh -c 'echo x >> '"$T"'/wlink && echo ok'
+expect "--ro on a symlink and on its directory" 0 "other" \
+    --ro "$T/link" --ro "$T" cat "$T/link"
 expect "--hide empties a directory" 0 "0" \
     --ro "$T/other" --hide "$T/other" sh -c 'ls -A '"$T"'/other | wc -l'
 expect "--hide empties a file" 0 "0" \
